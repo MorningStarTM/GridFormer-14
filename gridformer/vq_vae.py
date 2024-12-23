@@ -45,21 +45,16 @@ class Encoder(nn.Module):
             print(f"An error occurred while loading the model: {e}")
         
 
-
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
 class VQEmbedding(nn.Module):
-    def __init__(self, num_embeddings, embedding_dim, commitment_cost=0.25):
+    def __init__(self, config, commitment_cost=0.25):
         super().__init__()
-        self.embedding_dim = embedding_dim
-        self.num_embeddings = num_embeddings
+        self.config = config
+        self.embedding_dim = self.config.embedding_dim
+        self.num_embeddings = self.config.num_embeddings
         self.commitment_cost = commitment_cost
 
         # Embedding codebook
-        self.embedding = nn.Embedding(num_embeddings, embedding_dim)
+        self.embedding = nn.Embedding(self.num_embeddings, self.embedding_dim)
         self.embedding.weight.data.uniform_(-1 / self.num_embeddings, 1 / self.num_embeddings)
 
     def forward(self, z):
@@ -132,3 +127,29 @@ class Decoder(nn.Module):
             print(f"Error: {e}. Model file not found at {model_path}")
         except Exception as e:
             print(f"An error occurred while loading the model: {e}")
+
+
+
+
+class VQVAE(nn.Module):
+    def __init__(self, config) -> None:
+        super(VQVAE, self).__init__()
+
+        self.config = config
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.encoder = Encoder(config=self.config).to(device=self.device)
+        self.vq = VQEmbedding(config=self.config).to(device=self.device)
+        self.decoder = Decoder(config=self.config).to(device=self.device)
+
+
+
+    def forward(self, x):
+        z = self.encoder(x)
+        z_q, loss, encoding_indices = self.vq(z)
+        pred_x = self.decoder(z_q)
+
+        return z, z_q, pred_x, loss, encoding_indices
+    
+
+    

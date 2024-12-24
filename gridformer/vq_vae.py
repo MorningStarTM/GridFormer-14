@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from gridformer.Utils.logger import logging
 
 
 
@@ -45,47 +46,78 @@ class Encoder(nn.Module):
             print(f"An error occurred while loading the model: {e}")
         
 
-class VQEmbedding(nn.Module):
-    def __init__(self, config, commitment_cost=0.25):
-        super().__init__()
+class VectorQuantizer(nn.Module):
+    def __init__(self, config):
+        """
+        Vector Quantizer for 1D data with latent space compression.
+
+        Args:
+            num_embeddings (int): Number of embedding vectors.
+            embedding_dim (int): Dimensionality of each embedding vector.
+            commitment_cost (float): Weight for commitment loss.
+            input_dim (int): Dimensionality of the input data.
+            latent_dim (int): Dimensionality of the latent space.
+        """
+        super(VectorQuantizer, self).__init__()
         self.config = config
-        self.embedding_dim = self.config.embedding_dim
-        self.num_embeddings = self.config.num_embeddings
-        self.commitment_cost = commitment_cost
+        self._embedding_dim = self.config.embedding_dim
+        self._num_embeddings = self.config.num_embeddings
+        self._commitment_cost = self.config.commitment_cost
 
-        # Embedding codebook
-        self.embedding = nn.Embedding(self.num_embeddings, self.embedding_dim)
-        self.embedding.weight.data.uniform_(-1 / self.num_embeddings, 1 / self.num_embeddings)
+        # Embedding layer
+        self._embedding = nn.Embedding(self._num_embeddings, self._embedding_dim)
+        self._embedding.weight.data.uniform_(-1 / self._num_embeddings, 1 / self._num_embeddings)
 
-    def forward(self, z):
-        # Reshape input for vector quantization
-        batch_size, input_dim = z.shape
-        assert input_dim == self.embedding_dim, "Input dimensionality must match embedding_dim"
+        # Linear layer to compress input_dim to latent_dim
+        #self.linear = nn.Linear(self.config.input_dim, self.config.latent_dim)
 
-        # Calculate distances between z and codebook embeddings |a-b|²
-        z_flattened = z.view(-1, self.embedding_dim)  # Shape: (batch_size, embedding_dim)
-        distances = (
-            torch.sum(z_flattened ** 2, dim=1, keepdim=True)  # a²
-            + torch.sum(self.embedding.weight.t() ** 2, dim=0, keepdim=True)  # b²
-            - 2 * torch.matmul(z_flattened, self.embedding.weight.t())  # -2ab
-        )
+    def forward(self, inputs):
+        # Compress input to latent_dim
+        input_shape = inputs.shape  
 
-        # index with the smallest distance
-        encoding_indices = torch.argmin(distances, dim=-1)
+        # Flatten input: (batch_size, latent_dim) -> (batch_size * latent_dim, embedding_dim)
+        flat_input = inputs.view(-1, input_shape[1])
 
-        # quantized vector
-        z_q = self.embedding(encoding_indices)
-        z_q = z_q.view(batch_size, self.embedding_dim)  # Reshape to original dimensions
+        # Calculate distances
+        distances = (torch.sum(flat_input**2, dim=1, keepdim=True) +
+                     torch.sum(self._embedding.weight**2, dim=1) -
+                     2 * torch.matmul(flat_input, self._embedding.weight.t()))
 
-        # Calculate the commitment loss
-        commitment_loss = self.commitment_cost * F.mse_loss(z_q.detach(), z)
-        embedding_loss = F.mse_loss(z_q, z.detach())
-        loss = embedding_loss + commitment_loss
+        # Encoding
+        encoding_indices = torch.argmin(distances, dim=1).unsqueeze(1)
+        encodings = torch.zeros(encoding_indices.shape[0], self._num_embeddings, device=inputs.device)
+        encodings.scatter_(1, encoding_indices, 1)
 
-        # Straight-through estimator trick for gradient backpropagation
-        z_q = z + (z_q - z).detach()
+        # Quantize
+        quantized = torch.matmul(encodings, self._embedding.weight).view(input_shape)
 
-        return z_q, loss, encoding_indices
+        # Loss
+        e_latent_loss = torch.nn.functional.mse_loss(quantized.detach(), inputs)
+        q_latent_loss = torch.nn.functional.mse_loss(quantized, inputs.detach())
+        loss = q_latent_loss + self._commitment_cost * e_latent_loss
+
+        # Gradient flow trick
+        quantized = inputs + (quantized - inputs).detach()
+        avg_probs = torch.mean(encodings, dim=0)
+        perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
+
+        # Return quantized latent space
+        return loss, quantized, perplexity, encodings.view(input_shape[0], -1)
+    
+
+    def save(self, model_name="vq"):
+        torch.save(self.state_dict(), os.path.join(self.config.path, model_name))
+
+    def load(self, model_name="vq"):
+        model_path = os.path.join(self.config.path, model_name)
+    
+        try:
+            self.load_state_dict(torch.load(model_path))
+            print(f"Model loaded successfully from {model_path}")
+        except FileNotFoundError as e:
+            print(f"Error: {e}. Model file not found at {model_path}")
+        except Exception as e:
+            print(f"An error occurred while loading the model: {e}")
 
 
 
@@ -139,17 +171,31 @@ class VQVAE(nn.Module):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.encoder = Encoder(config=self.config).to(device=self.device)
-        self.vq = VQEmbedding(config=self.config).to(device=self.device)
+        self.vq = VectorQuantizer(config=self.config).to(device=self.device)
         self.decoder = Decoder(config=self.config).to(device=self.device)
 
 
 
     def forward(self, x):
         z = self.encoder(x)
-        z_q, loss, encoding_indices = self.vq(z)
-        pred_x = self.decoder(z_q)
+        loss, quantized, perplexity, encodings = self.vq(z)
+        pred_x = self.decoder(quantized)
 
-        return z, z_q, pred_x, loss, encoding_indices
+        return pred_x, loss, quantized, perplexity, encodings
+    
+
+    def save_model(self):
+        self.encoder.save()
+        self.decoder.save()
+        self.vq.save()
+        logging.info("model saved")
+
+    def load_model(self):
+        self.encoder.load()
+        self.decoder.load()
+        self.vq.load()
     
 
     
+    
+

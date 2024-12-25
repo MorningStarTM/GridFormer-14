@@ -31,8 +31,13 @@ class Encoder(nn.Module):
         return x
     
 
-    def save(self, model_name="encoder"):
-        torch.save(self.state_dict(), os.path.join(self.config.path, model_name))
+    def save(self, path=None, model_name="encoder"):
+        if path:
+            model_path = os.path.join(path, model_name)
+        else:
+            model_path = os.path.join(self.config.path, model_name)
+        torch.save(self.state_dict(), model_path)
+
 
     def load(self, model_name="encoder"):
         model_path = os.path.join(self.config.path, model_name)
@@ -101,8 +106,13 @@ class VectorQuantizer(nn.Module):
 
     
 
-    def save(self, model_name="vq"):
-        torch.save(self.state_dict(), os.path.join(self.config.path, model_name))
+    def save(self, path=None, model_name="vq"):
+        if path:
+            model_path = os.path.join(path, model_name)
+        else:
+            model_path = os.path.join(self.config.path, model_name)
+        torch.save(self.state_dict(), model_path)
+
 
     def load(self, model_name="vq"):
         model_path = os.path.join(self.config.path, model_name)
@@ -142,8 +152,14 @@ class Decoder(nn.Module):
         return x
     
 
-    def save(self, model_name="decoder"):
-        torch.save(self.state_dict(), os.path.join(self.config.path, model_name))
+    def save(self, path=None, model_name="decoder"):
+        if path:
+            model_path = os.path.join(path, model_name)
+        else:
+            model_path = os.path.join(self.config.path, model_name)
+        torch.save(self.state_dict(), model_path)
+
+
 
     def load(self, model_name="decoder"):
         model_path = os.path.join(self.config.path, model_name)
@@ -180,11 +196,17 @@ class VQVAE(nn.Module):
         return pred_x, vq_loss, indices
     
 
-    def save_model(self):
-        self.encoder.save()
-        self.decoder.save()
-        self.vq.save()
-        logging.info("model saved")
+    def save_model(self, custom_path=None):
+        if custom_path:
+            self.encoder.save(path=custom_path)
+            self.decoder.save(path=custom_path)
+            self.vq.save(path=custom_path)
+            logging.info("model saved")
+        else:
+            self.encoder.save()
+            self.decoder.save()
+            self.vq.save()
+            logging.info("model saved")
 
     def load_model(self):
         self.encoder.load()

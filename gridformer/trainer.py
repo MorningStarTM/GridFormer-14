@@ -63,4 +63,46 @@ class VQTrainer:
                     self.model.save_model()
                 print(f"Model saved at {avg_recon_loss:.3f}")
                 best_score = avg_recon_loss
+
+    
+
+    def train_data(self, epochs, dataloader, data_variance, save_path=None):
+        
+        best_score = float('inf')
+        num = 0
+        for observation in dataloader:
+            num += 1
+            pred_x, vq_loss, encodings = self.model(observation)
+            recon_error = F.mse_loss(pred_x, observation) / data_variance
+
+            self.optimizer.zero_grad()
+            loss = recon_error + vq_loss
+            loss.backward()
+
+            self.optimizer.step()
+                
+
+ 
+
+            # Print loss after every epoch
+            logging.info(
+                f"Epoch {num} - "
+                f"Reconstruction Loss: {recon_error:.4f}, "
+                f"VQ Loss: {vq_loss:.4f}, "
+                f"Total Loss: {loss:.4f}"
+            )
+
+            print(
+                f"Epoch {num} - "
+                f"Reconstruction Loss: {recon_error:.4f}, "
+            ) 
+
+
+            if recon_error < best_score:
+                if save_path:
+                    self.model.save_model(custom_path=save_path)
+                else:
+                    self.model.save_model()
+                print(f"Model saved at {recon_error:.3f}")
+                best_score = recon_error
                 

@@ -11,7 +11,7 @@ class VQTrainer:
         self.model = model
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.config.learning_rate)
 
-    def train(self, epochs, dataloader, data_variance):
+    def train(self, epochs, dataloader, data_variance, save_path=None):
         for epoch in range(epochs):
             epoch_recon_loss = 0.0
             epoch_vq_loss = 0.0
@@ -57,7 +57,10 @@ class VQTrainer:
 
 
             if avg_recon_loss < best_score:
-                self.model.save_model()
+                if save_path:
+                    self.model.save_model(custom_path=save_path)
+                else:
+                    self.model.save_model()
                 print(f"Model saved at {avg_recon_loss:.3f}")
                 best_score = avg_recon_loss
                 

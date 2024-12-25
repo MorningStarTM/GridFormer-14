@@ -52,11 +52,10 @@ class VectorQuantizer(nn.Module):
         Vector Quantizer for 1D data with latent space compression.
 
         Args:
-            num_embeddings (int): Number of embedding vectors.
-            embedding_dim (int): Dimensionality of each embedding vector.
-            commitment_cost (float): Weight for commitment loss.
-            input_dim (int): Dimensionality of the input data.
-            latent_dim (int): Dimensionality of the latent space.
+            config (object): Configuration object containing:
+                - num_embeddings (int): Number of embedding vectors.
+                - embedding_dim (int): Dimensionality of each embedding vector.
+                - commitment_cost (float): Weight for commitment loss.
         """
         super(VectorQuantizer, self).__init__()
         self.config = config
@@ -68,41 +67,38 @@ class VectorQuantizer(nn.Module):
         self._embedding = nn.Embedding(self._num_embeddings, self._embedding_dim)
         self._embedding.weight.data.uniform_(-1 / self._num_embeddings, 1 / self._num_embeddings)
 
-        # Linear layer to compress input_dim to latent_dim
-        #self.linear = nn.Linear(self.config.input_dim, self.config.latent_dim)
+    def forward(self, z):
+        """
+        Forward pass of the Vector Quantizer.
 
-    def forward(self, inputs):
-        # Compress input to latent_dim
-        input_shape = inputs.shape  
+        Args:
+            z (torch.Tensor): Latent representation from the encoder. Shape: (batch_size, embedding_dim)
 
-        # Flatten input: (batch_size, latent_dim) -> (batch_size * latent_dim, embedding_dim)
-        flat_input = inputs.view(-1, input_shape[1])
+        Returns:
+            z_q (torch.Tensor): Quantized representation. Shape: (batch_size, embedding_dim)
+            loss (torch.Tensor): VQ loss (reconstruction + commitment).
+            indices (torch.Tensor): Indices of the nearest embeddings. Shape: (batch_size,)
+        """
+        # Compute distances to each embedding
+        z_flattened = z.unsqueeze(1)  # Shape: (batch_size, 1, embedding_dim)
+        embeddings = self._embedding.weight.unsqueeze(0)  # Shape: (1, num_embeddings, embedding_dim)
+        distances = torch.sum((z_flattened - embeddings) ** 2, dim=2)  # Shape: (batch_size, num_embeddings)
 
-        # Calculate distances
-        distances = (torch.sum(flat_input**2, dim=1, keepdim=True) +
-                     torch.sum(self._embedding.weight**2, dim=1) -
-                     2 * torch.matmul(flat_input, self._embedding.weight.t()))
+        # Find nearest embeddings
+        indices = torch.argmin(distances, dim=1)  # Shape: (batch_size,)
 
-        # Encoding
-        encoding_indices = torch.argmin(distances, dim=1).unsqueeze(1)
-        encodings = torch.zeros(encoding_indices.shape[0], self._num_embeddings, device=inputs.device)
-        encodings.scatter_(1, encoding_indices, 1)
+        # Retrieve quantized vectors
+        z_q = self._embedding(indices)  # Shape: (batch_size, embedding_dim)
 
-        # Quantize
-        quantized = torch.matmul(encodings, self._embedding.weight).view(input_shape)
+        # Compute VQ loss
+        commitment_loss = self._commitment_cost * F.mse_loss(z.detach(), z_q)
+        vq_loss = F.mse_loss(z_q, z.detach()) + commitment_loss
 
-        # Loss
-        e_latent_loss = torch.nn.functional.mse_loss(quantized.detach(), inputs)
-        q_latent_loss = torch.nn.functional.mse_loss(quantized, inputs.detach())
-        loss = q_latent_loss + self._commitment_cost * e_latent_loss
+        # Use straight-through estimator for backpropagation
+        z_q = z + (z_q - z).detach()
 
-        # Gradient flow trick
-        quantized = inputs + (quantized - inputs).detach()
-        avg_probs = torch.mean(encodings, dim=0)
-        perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
+        return z_q, vq_loss, indices
 
-        # Return quantized latent space
-        return loss, quantized, perplexity, encodings.view(input_shape[0], -1)
     
 
     def save(self, model_name="vq"):
@@ -178,10 +174,10 @@ class VQVAE(nn.Module):
 
     def forward(self, x):
         z = self.encoder(x)
-        loss, quantized, perplexity, encodings = self.vq(z)
-        pred_x = self.decoder(quantized)
+        z_q, vq_loss, indices = self.vq(z)
+        pred_x = self.decoder(z_q)
 
-        return pred_x, loss, quantized, perplexity, encodings
+        return pred_x, vq_loss, indices
     
 
     def save_model(self):

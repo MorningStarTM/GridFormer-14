@@ -23,8 +23,7 @@ class VQTrainer:
             for observation in dataloader:
                 num_batches += 1
 
-                train_res_recon_error = []
-                pred_x, vq_loss, quantized, perplexity, encodings = self.model(observation)
+                pred_x, vq_loss, encodings = self.model(observation)
                 recon_error = F.mse_loss(pred_x, observation) / data_variance
 
                 self.optimizer.zero_grad()
@@ -58,6 +57,7 @@ class VQTrainer:
 
 
             if avg_recon_loss < best_score:
-                best_score = avg_recon_loss
                 self.model.save_model()
                 print(f"Model saved at {avg_recon_loss:.3f}")
+                best_score = avg_recon_loss
+                

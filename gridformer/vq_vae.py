@@ -21,14 +21,20 @@ class Encoder(nn.Module):
                         nn.ReLU(),
                         nn.Linear(input_dim//4, input_dim//8),
                         nn.ReLU(),
-                        nn.Linear(input_dim//8, self.config.latent_dim)
+                        nn.Linear(input_dim//8, self.config.latent_dim*2)
         )
 
 
     
     def forward(self, x):
-        x = self.encoder(x)
-        return x
+        latent_params = self.encoder(x)
+        mean, log_var = torch.chunk(latent_params, 2, dim=-1)
+
+        log_var = torch.clamp(log_var, min=-10, max=10) # for avoid nan value return and numerical stability
+        std = torch.exp(0.5 * log_var)
+        dist = torch.distributions.Normal(mean, std)
+
+        return dist.rsample()
     
 
     def save(self, path=None, model_name="encoder"):
@@ -71,6 +77,8 @@ class VectorQuantizer(nn.Module):
         # Embedding layer
         self._embedding = nn.Embedding(self._num_embeddings, self._embedding_dim)
         self._embedding.weight.data.uniform_(-1 / self._num_embeddings, 1 / self._num_embeddings)
+
+
 
     def forward(self, z):
         """

@@ -196,6 +196,36 @@ class VAE(nn.Module):
 
     
     def train(self, data_loader, epochs):
-        pass
+        best_loss = float('inf')
+        for i in range(epochs):
+            total_loss = 0.0
+            loop_count = 0
+
+            for loop_count, (obs, _, _, _, _) in enumerate(data_loader, start=1): 
+
+                obs = obs.to(self.device)
+                feature, reconstructed_obs, policy_obs, mean, log_var = self.forward(obs)
+
+                loss, _, _, _ = self.vae_loss(feature, reconstructed_obs, policy_obs, mean, log_var)
+
+                total_loss += loss.item()
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+
+            
+            avg_total_loss = total_loss / loop_count
+
+            print(
+                f"Epochs : {loop_count+1}"
+                f"Loss = {avg_total_loss:.3f}")
+            
+
+            if avg_total_loss < best_loss:
+                best_loss = avg_total_loss
+                self.save()
+                print(f"New best model saved with Avg Total Loss = {avg_total_loss:.3f}")   
+
 
     

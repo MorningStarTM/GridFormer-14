@@ -35,6 +35,15 @@ class VAE(nn.Module):
                         nn.Linear(output_dim*8, input_dim)
         )
 
+        self.policy_decoder = nn.Sequential(
+                        nn.Linear(output_dim, output_dim*2),
+                        nn.ReLU(),
+                        nn.Linear(output_dim*2, output_dim*4),
+                        nn.ReLU(),
+                        nn.Linear(output_dim*4, output_dim*8),
+                        nn.ReLU(),
+                        nn.Linear(output_dim*8, input_dim)
+        )
 
         self.optimizer = optim.Adam(self.parameters(), lr=self.config['lr'])
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -54,7 +63,13 @@ class VAE(nn.Module):
         sample = dist.rsample()
 
         obs = self.decoder(sample)
-        return feature, obs, mean, log_var
+
+
+        #convert latent space 
+        continuous_latent_space_ = self.continuous_latent_space(sample, self.config['num_categories'])
+        policy_obs = self.policy_decoder(continuous_latent_space_)
+
+        return feature, obs, policy_obs, mean, log_var
     
 
     def get_latent_space(self, x):
@@ -70,6 +85,18 @@ class VAE(nn.Module):
 
         return sample
     
+
+    def continuous_latent_space(self, sample, num_categories):
+        # Get the min and max range for the continuous values (assuming normalized range [-1, 1])
+        z_min, z_max = -1.0, 1.0  # You can customize this range based on your encoder's output
+
+        # Scale the continuous values to the range [0, num_categories)
+        z_scaled = (sample - z_min) / (z_max - z_min) * num_categories
+
+        # Discretize by assigning to the nearest integer bucket
+        z_discrete = torch.clamp(z_scaled.long(), 0, num_categories - 1)  # Ensure values are within valid category range
+
+        return self.convert_discrete_to_continuous(z_discrete, num_categories)
 
 
     def discretize_continuous_values(self, x, num_categories):
@@ -133,7 +160,7 @@ class VAE(nn.Module):
 
 
     
-    def vae_loss(self, x, reconstructed_x, mean, log_var, beta=1.0):
+    def vae_loss(self, feature, reconstructed_x, policy_obs, mean, log_var, beta=1.0):
         """
         Compute the VAE loss, which includes reconstruction loss and KL divergence.
 
@@ -150,13 +177,21 @@ class VAE(nn.Module):
             kl_div (Tensor): KL divergence.
         """
         # Reconstruction loss (using Mean Squared Error)
-        recon_loss = F.mse_loss(reconstructed_x, x, reduction='mean')
+        recon_loss = F.mse_loss(reconstructed_x, feature, reduction='mean')
+        policy_recon_loss = F.mse_loss(policy_obs, feature, reduction='mean')
 
         # KL Divergence: KL(N(mean, std) || N(0, 1))
         kl_div = -0.5 * torch.sum(1 + log_var - mean.pow(2) - log_var.exp(), dim=-1).mean()
-        loss = recon_loss + beta * kl_div
 
-        return loss, recon_loss, kl_div
+        align_loss = F.kl_div(
+                    policy_obs.log_softmax(dim=-1),
+                    reconstructed_x.detach().softmax(dim=-1),  # Detach reconstructed_x
+                    reduction='batchmean',
+                )
+        
+        loss = recon_loss + policy_recon_loss + (beta * kl_div) + (beta * align_loss)
+
+        return loss, recon_loss, kl_div, align_loss
     
 
     

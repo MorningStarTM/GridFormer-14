@@ -86,9 +86,20 @@ class VAE(nn.Module):
         return sample
     
 
-    def continuous_latent_space(self, sample, num_categories):
+    def continuous_latent_space(self, sample, num_categories, noise_std=0.01):
+        """
+        Convert latent space to continuous space after discretization and add noise.
+
+        Args:
+            sample (Tensor): Latent space sample from the encoder.
+            num_categories (int): Number of categories (bins).
+            noise_std (float): Standard deviation of the Gaussian noise to add.
+
+        Returns:
+            Tensor: Continuous latent space with noise added.
+        """ 
         # Get the min and max range for the continuous values (assuming normalized range [-1, 1])
-        z_min, z_max = -1.0, 1.0  # You can customize this range based on your encoder's output
+        z_min, z_max = -1.0, 1.0  # Customize based on encoder's output range
 
         # Scale the continuous values to the range [0, num_categories)
         z_scaled = (sample - z_min) / (z_max - z_min) * num_categories
@@ -96,7 +107,15 @@ class VAE(nn.Module):
         # Discretize by assigning to the nearest integer bucket
         z_discrete = torch.clamp(z_scaled.long(), 0, num_categories - 1)  # Ensure values are within valid category range
 
-        return self.convert_discrete_to_continuous(z_discrete, num_categories)
+        # Convert back to continuous values
+        z_continuous = self.convert_discrete_to_continuous(z_discrete, num_categories)
+
+        # Inject Gaussian noise into the continuous latent space
+        noise = torch.randn_like(z_continuous) * noise_std
+        z_continuous_with_noise = z_continuous + noise
+
+        return z_continuous_with_noise
+
 
 
     def discretize_continuous_values(self, x, num_categories):

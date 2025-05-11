@@ -5,6 +5,7 @@ from tqdm import tqdm
 from grid2op.Exceptions import *
 from gridformer.Utils.converter import ActionConverter
 from grid2op.Agent import TopologyGreedy
+import joblib
 
 class DataGenerator:
     def __init__(self, env, agent:TopologyGreedy, action_converter:ActionConverter, save_path="data", use_agent=False):
@@ -115,5 +116,5 @@ class DataGenerator:
         """
         file_path = os.path.join(self.save_path, f"episode_{episode_id}.pkl")
         with open(file_path, "wb") as f:
-            dill.dump(data, f)
+            joblib.dump(data, f)
         print(f"Saved episode {episode_id} data to {file_path}")

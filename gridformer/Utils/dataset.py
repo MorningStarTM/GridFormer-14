@@ -1,9 +1,10 @@
 import torch
 import os
+import dill
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
 from gridformer.Utils.utils import Config
-from gridformer.Utils.logger import logging
+from gridformer.Utils.logger import logger
 
 
 config = Config.from_yaml('config.yml')
@@ -29,44 +30,62 @@ def one_hot_encode(actions, num_actions):
 
 
 
-def load_npz_files_from_folder(folder_path, start=0, end=100):
-    all_observations = []
-    all_rewards = []
-    all_actions = []
-    all_dones = []
-    all_next_observations = []
+def extract_essential_obs(obs_dict: dict):
+    """
+    Extract important features from the observation dictionary and flatten into a list.
+    """
+    flat = []
 
+    # Flatten nested components
+    for comp in ['loads', 'gens', 'prods', 'lines_or', 'lines_ex']:
+        if comp in obs_dict:
+            for subkey, values in obs_dict[comp].items():
+                flat.extend(values.tolist())
+
+    # Flatten flat components
+    for key in ['rho', 'line_status', 'topo_vect']:
+        if key in obs_dict:
+            flat.extend(obs_dict[key].astype(float).tolist())
+
+    return flat
+
+
+def load_from_pkl_as_numpy(file_path):
+    """
+    Load .pkl file and convert obs/next_obs to essential vectors. Return everything as np arrays.
     
-    folder = os.listdir(folder_path)
-    # Iterate through all .npz files in the folder
-    for filename in folder[start:end]:
-        if filename.endswith(".npz"):
-            file_path = os.path.join(folder_path, filename)
-            npz_data = np.load(file_path, allow_pickle=True)
-            
-            all_observations.append(npz_data['obs'])
-            all_rewards.append(npz_data['reward'])
-            all_actions.append(npz_data['action'])
-            all_dones.append(npz_data['done'])
-            all_next_observations.append(npz_data['obs_next'])
+    Args:
+        file_path (str): path to .pkl file
     
+    Returns:
+        tuple of np.ndarray: (observations, rewards, actions, dones, next_observations)
+    """
+    with open(file_path, 'rb') as f:
+        data = dill.load(f)
 
-    # Concatenate all arrays along the first axis (stacking the data)
-    observations = np.concatenate(all_observations, axis=0)
-    rewards = np.concatenate(all_rewards, axis=0)
-    actions = np.concatenate(all_actions, axis=0)
-    dones = np.concatenate(all_dones, axis=0)
-    next_observations = np.concatenate(all_next_observations, axis=0)
+    obs = []
+    next_obs = []
+    rewards = data['rewards']
+    actions = data['actions']
+    dones = data['done']
 
+    for ob, nob in zip(data['obs'], data['next_obs']):
+        ob_dict = ob.to_dict() if hasattr(ob, 'to_dict') else ob
+        nob_dict = nob.to_dict() if hasattr(nob, 'to_dict') else nob
+        
 
-    reward_min = rewards.min()
-    reward_max = rewards.max()
-    rewards = (rewards - reward_min) / (reward_max - reward_min)
-    logging.info(f"reward min : {reward_min} - reward max : {reward_max}")
+        obs.append(extract_essential_obs(ob_dict))
+        next_obs.append(extract_essential_obs(nob_dict))
 
-    one_hot_actions = one_hot_encode(actions, config.action_dim)
-    
-    return observations, rewards, one_hot_actions, dones, next_observations
+    # Convert everything to NumPy arrays
+    obs = np.array(obs, dtype=np.float32)
+    next_obs = np.array(next_obs, dtype=np.float32)
+    rewards = np.array(rewards, dtype=np.float32)
+    actions = np.array(actions, dtype=np.int32)
+    dones = np.array(dones, dtype=np.float32)
+
+    return obs, rewards, actions, dones, next_obs
+
 
 
 

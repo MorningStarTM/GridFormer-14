@@ -88,6 +88,32 @@ def load_from_pkl_as_numpy(file_path):
 
 
 
+class GridSequenceDataset(Dataset):
+    def __init__(self, observations, rewards, actions, dones, next_observations, seq_len, device):
+        self.seq_len = seq_len
+        self.device = device
+
+        # Convert to tensors first
+        self.observations = torch.tensor(np.array(observations, np.float32), dtype=torch.float32)
+        self.rewards = torch.tensor(np.array(rewards, np.float32), dtype=torch.float32)
+        self.actions = torch.tensor(np.array(actions, np.float32), dtype=torch.float32)  # One-hot or continuous
+        self.dones = torch.tensor(np.array(dones, np.float32), dtype=torch.float32)
+        self.next_observations = torch.tensor(np.array(next_observations, np.float32), dtype=torch.float32)
+
+    def __len__(self):
+        return len(self.observations) - self.seq_len
+
+    def __getitem__(self, idx):
+        # Sequence of obs and actions
+        obs_seq = self.observations[idx:idx+self.seq_len].to(self.device)
+        act_seq = self.actions[idx:idx+self.seq_len].to(self.device)
+
+        # Targets from the last step
+        reward = self.rewards[idx + self.seq_len - 1].to(self.device)
+        done = self.dones[idx + self.seq_len - 1].to(self.device)
+        next_obs = self.next_observations[idx + self.seq_len - 1].to(self.device)
+
+        return obs_seq, act_seq, reward, done, next_obs
 
 
 class GrdiDataset(Dataset):

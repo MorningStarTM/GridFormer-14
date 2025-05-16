@@ -1,6 +1,11 @@
 import torch
 import torch.nn as nn
 import math
+from torch.utils.tensorboard import SummaryWriter
+from pathlib import Path
+from tqdm import tqdm
+import os
+from gridformer.Utils.logger import logger
 
 
 class InputEmbedding(nn.Module):
@@ -230,14 +235,14 @@ class GridFormer(nn.Module):
                  d_ff: int = 2048,
                  dropout: float = 0.1):
         super().__init__()
-
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         # Embedding layers for input (observation + action)
-        self.src_embed = InputEmbedding(d_model, obs_dim + action_dim)
-        self.tgt_embed = InputEmbedding(d_model, obs_dim + action_dim)
+        self.src_embed = InputEmbedding(d_model, obs_dim + action_dim).to(self.device)
+        self.tgt_embed = InputEmbedding(d_model, obs_dim + action_dim).to(self.device)
 
         # Positional encodings
-        self.src_pos = PositionalEncoding(d_model, seq_len, dropout)
-        self.tgt_pos = PositionalEncoding(d_model, seq_len, dropout)
+        self.src_pos = PositionalEncoding(d_model, seq_len, dropout).to(self.device)
+        self.tgt_pos = PositionalEncoding(d_model, seq_len, dropout).to(self.device)
 
         # Encoder
         encoder_layers = nn.ModuleList([
@@ -247,7 +252,7 @@ class GridFormer(nn.Module):
                 dropout
             ) for _ in range(n_layers)
         ])
-        self.encoder = Encoder(encoder_layers)
+        self.encoder = Encoder(encoder_layers).to(self.device)
 
         # Decoder
         decoder_layers = nn.ModuleList([
@@ -258,10 +263,10 @@ class GridFormer(nn.Module):
                 dropout
             ) for _ in range(n_layers)
         ])
-        self.decoder = Decoder(decoder_layers)
+        self.decoder = Decoder(decoder_layers).to(self.device)
 
         # Output projection layer
-        self.projection = ProjectionLayer(d_model, obs_dim)
+        self.projection = ProjectionLayer(d_model, obs_dim).to(self.device)
 
         # Xavier initialization
         for p in self.parameters():
@@ -277,3 +282,116 @@ class GridFormer(nn.Module):
 
         next_obs, reward, done = self.projection(decoded)
         return next_obs, reward, done
+
+
+
+
+class GridFormerTrainer:
+    def __init__(self, model:GridFormer, config, train_dataloader, val_dataloader):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = model.to(self.device)
+        self.config = config
+        self.train_dataloader = train_dataloader
+        self.val_dataloader = val_dataloader
+        self.writer = SummaryWriter(log_dir=config['log_dir'])
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config['lr'])
+        self.loss_fn = nn.MSELoss()  # MSE for continuous next_obs and reward
+
+        # Make sure weight dir exists
+        Path(config['model_dir']).mkdir(parents=True, exist_ok=True)
+
+        # Load checkpoint if available
+        self.global_step = 0
+        self.start_epoch = 0
+        if config.get('preload', None):
+            self._load_checkpoint(config['preload'])
+
+    def _load_checkpoint(self, ckpt_path):
+        if os.path.exists(ckpt_path):
+            checkpoint = torch.load(ckpt_path)
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            self.global_step = checkpoint['global_step']
+            self.start_epoch = checkpoint['epoch'] + 1
+            logger.info(f"Checkpoint loaded: {ckpt_path}")
+        else:
+            logger.warning(f"No checkpoint found at: {ckpt_path}")
+
+    def train(self):
+        for epoch in range(self.start_epoch, self.config['num_epochs']):
+            self.model.train()
+            loop = tqdm(self.train_dataloader, desc=f"Epoch {epoch:02d}")
+
+            total_loss = 0.0
+            for batch in loop:
+                obs_seq, act_seq, reward, done, next_obs = batch
+                
+                obs_seq = obs_seq.to(self.config['device'])       # (B, seq_len, obs_dim)
+                act_seq = act_seq.to(self.config['device'])       # (B, seq_len, act_dim)
+                reward = reward.to(self.config['device'])         # (B,)
+                done = done.to(self.config['device'])             # (B,)
+                next_obs = next_obs.to(self.config['device'])     # (B, obs_dim)
+
+                pred_next_obs, pred_reward, pred_done = self.model(obs_seq, act_seq)
+
+                # Losses
+                loss_obs = self.loss_fn(pred_next_obs[:, -1, :], next_obs)
+                loss_rew = self.loss_fn(pred_reward[:, -1], reward)
+                loss_done = nn.BCELoss()(pred_done[:, -1], done.squeeze(-1))
+
+                loss = loss_obs + loss_rew + loss_done
+
+                self.writer.add_scalar('train/loss_obs', loss_obs.item(), self.global_step)
+                self.writer.add_scalar('train/loss_reward', loss_rew.item(), self.global_step)
+                self.writer.add_scalar('train/loss_done', loss_done.item(), self.global_step)
+                self.writer.add_scalar('train/total_loss', loss.item(), self.global_step)
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+
+                self.optimizer.step()
+                self.global_step += 1
+                total_loss += loss.item()
+
+                loop.set_postfix(loss=loss.item())
+
+            avg_loss = total_loss / len(self.train_dataloader)
+            logger.info(f"Epoch {epoch} | Avg Loss: {avg_loss:.4f}")
+
+            # Save model
+            save_path = os.path.join(self.config['model_dir'], f"gridformer_epoch_{epoch}.pt")
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': self.model.state_dict(),
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'global_step': self.global_step
+            }, save_path)
+            logger.info(f"Model saved at: {save_path}")
+
+
+    def evaluate(self):
+        self.model.eval()
+        with torch.no_grad():
+            total_loss = 0.0
+            for batch in tqdm(self.val_dataloader, desc="Evaluating"):
+                obs = batch['obs'].to(self.config['device'])
+                act = batch['action'].to(self.config['device'])
+                next_obs = batch['next_obs'].to(self.config['device'])
+                reward = batch['reward'].to(self.config['device'])
+                done = batch['done'].to(self.config['device'])
+
+                pred_next_obs, pred_reward, pred_done = self.model(obs, act)
+                loss_obs = self.loss_fn(pred_next_obs, next_obs)
+                loss_rew = self.loss_fn(pred_reward, reward)
+                loss_done = nn.BCELoss()(pred_done, done)
+                loss = loss_obs + loss_rew + loss_done
+
+                total_loss += loss.item()
+
+        avg_val_loss = total_loss / len(self.val_dataloader)
+        logger.info(f"Validation Loss: {avg_val_loss:.4f}")
+        return avg_val_loss
+
+
+

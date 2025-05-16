@@ -104,16 +104,16 @@ class GridSequenceDataset(Dataset):
         return len(self.observations) - self.seq_len
 
     def __getitem__(self, idx):
-        # Sequence of obs and actions
-        obs_seq = self.observations[idx:idx+self.seq_len].to(self.device)
-        act_seq = self.actions[idx:idx+self.seq_len].to(self.device)
+        obs_seq = self.observations[idx:idx+self.seq_len]
+        act_seq = self.actions[idx:idx+self.seq_len].unsqueeze(-1).to(self.device)  # Make it [seq_len, 1]
 
-        # Targets from the last step
-        reward = self.rewards[idx + self.seq_len - 1].to(self.device)
-        done = self.dones[idx + self.seq_len - 1].to(self.device)
-        next_obs = self.next_observations[idx + self.seq_len - 1].to(self.device)
+        # Make target also 3D: [seq_len=1, dim]
+        reward = self.rewards[idx + self.seq_len - 1].unsqueeze(0)
+        done = self.dones[idx + self.seq_len - 1].unsqueeze(0)
+        next_obs = self.next_observations[idx + self.seq_len - 1].unsqueeze(0)
 
-        return obs_seq, act_seq, reward, done, next_obs
+        return obs_seq.to(self.device), act_seq.to(self.device), reward.to(self.device), done.to(self.device), next_obs.to(self.device)
+
 
 
 class GrdiDataset(Dataset):

@@ -50,6 +50,51 @@ def extract_essential_obs(obs_dict: dict):
     return flat
 
 
+
+
+def load_from_multiple_pkl_as_numpy(file_paths):
+    """
+    Load multiple .pkl files and convert obs/next_obs to essential vectors.
+    Return everything as concatenated np arrays.
+
+    Args:
+        file_paths (list): list of paths to .pkl files
+
+    Returns:
+        tuple of np.ndarray: (observations, rewards, actions, dones, next_observations)
+    """
+    all_obs = []
+    all_next_obs = []
+    all_rewards = []
+    all_actions = []
+    all_dones = []
+
+    for file_path in file_paths:
+        print(file_path)
+        with open(file_path, 'rb') as f:
+            data = dill.load(f)
+
+        for ob, nob in zip(data['obs'], data['next_obs']):
+            ob_dict = ob.to_dict() if hasattr(ob, 'to_dict') else ob
+            nob_dict = nob.to_dict() if hasattr(nob, 'to_dict') else nob
+
+            all_obs.append(extract_essential_obs(ob_dict))
+            all_next_obs.append(extract_essential_obs(nob_dict))
+
+        all_rewards.extend(data['rewards'])
+        all_actions.extend(data['actions'])
+        all_dones.extend(data['done'])
+
+    # Convert to NumPy arrays
+    obs = np.array(all_obs, dtype=np.float32)
+    next_obs = np.array(all_next_obs, dtype=np.float32)
+    rewards = np.array(all_rewards, dtype=np.float32)
+    actions = np.array(all_actions, dtype=np.int32)
+    dones = np.array(all_dones, dtype=np.float32)
+
+    return obs, rewards, actions, dones, next_obs
+
+
 def load_from_pkl_as_numpy(file_path):
     """
     Load .pkl file and convert obs/next_obs to essential vectors. Return everything as np arrays.

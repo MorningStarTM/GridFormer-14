@@ -28,6 +28,66 @@ def one_hot_encode(actions, num_actions):
     return np.array(one_hot_actions)
 
 
+import numpy as np
+
+def filter_relevant_features(obs_dict):
+    """
+    Extract and filter only the relevant features from the observation dictionary.
+
+    Args:
+        obs_dict (dict): The observation dictionary.
+
+    Returns:
+        list: A flattened list of relevant features.
+    """
+    relevant_features = []
+
+    # Line features
+    if "lines_or" in obs_dict:
+        lines_or = obs_dict["lines_or"]
+        relevant_features.extend(lines_or["p"].tolist())  # Active power
+        relevant_features.extend(lines_or["q"].tolist())  # Reactive power
+        relevant_features.extend(lines_or["v"].tolist())  # Voltage magnitude
+        relevant_features.extend(lines_or["a"].tolist())  # Current magnitude
+
+    if "rho" in obs_dict:
+        relevant_features.extend(obs_dict["rho"].tolist())  # Line loading ratio
+
+    # Load features
+    if "loads" in obs_dict:
+        loads = obs_dict["loads"]
+        relevant_features.extend(loads["p"].tolist())  # Active power
+        relevant_features.extend(loads["q"].tolist())  # Reactive power
+        relevant_features.extend(loads["v"].tolist())  # Voltage magnitude
+
+    # Generator features
+    if "gens" in obs_dict:
+        gens = obs_dict["gens"]
+        relevant_features.extend(gens["p"].tolist())  # Active power
+        relevant_features.extend(gens["q"].tolist())  # Reactive power
+        relevant_features.extend(gens["v"].tolist())  # Voltage magnitude
+
+    # Topology features
+    if "topo_vect" in obs_dict:
+        relevant_features.extend(obs_dict["topo_vect"].tolist())  # Topology vector
+
+    if "line_status" in obs_dict:
+        relevant_features.extend(obs_dict["line_status"].astype(float).tolist())  # Line status (binary)
+
+    # Maintenance and cooldown features
+    if "maintenance" in obs_dict and "time_next_maintenance" in obs_dict["maintenance"]:
+        relevant_features.extend(obs_dict["maintenance"]["time_next_maintenance"].tolist())  # Time to next maintenance
+
+    if "cooldown" in obs_dict and "line" in obs_dict["cooldown"]:
+        relevant_features.extend(obs_dict["cooldown"]["line"].tolist())  # Line cooldown times
+
+    # Redispatching features
+    if "redispatching" in obs_dict:
+        relevant_features.extend(obs_dict["redispatching"]["target_redispatch"].tolist())  # Target redispatch
+        relevant_features.extend(obs_dict["redispatching"]["actual_dispatch"].tolist())  # Actual redispatch
+
+    return relevant_features
+
 
 
 def extract_essential_obs(obs_dict: dict):
@@ -78,8 +138,8 @@ def load_from_multiple_pkl_as_numpy(file_paths):
             ob_dict = ob.to_dict() if hasattr(ob, 'to_dict') else ob
             nob_dict = nob.to_dict() if hasattr(nob, 'to_dict') else nob
 
-            all_obs.append(extract_essential_obs(ob_dict))
-            all_next_obs.append(extract_essential_obs(nob_dict))
+            all_obs.append(filter_relevant_features(ob_dict))
+            all_next_obs.append(filter_relevant_features(nob_dict))
 
         all_rewards.extend(data['rewards'])
         all_actions.extend(data['actions'])
@@ -119,8 +179,8 @@ def load_from_pkl_as_numpy(file_path):
         nob_dict = nob.to_dict() if hasattr(nob, 'to_dict') else nob
         
 
-        obs.append(extract_essential_obs(ob_dict))
-        next_obs.append(extract_essential_obs(nob_dict))
+        obs.append(filter_relevant_features(ob_dict))
+        next_obs.append(filter_relevant_features(nob_dict))
 
     # Convert everything to NumPy arrays
     obs = np.array(obs, dtype=np.float32)

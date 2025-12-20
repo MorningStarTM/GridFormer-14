@@ -112,13 +112,16 @@ def extract_essential_obs(obs_dict: dict):
 
 
 
-def load_from_multiple_pkl_as_numpy(file_paths):
+def load_from_multiple_pkl_as_numpy(file_paths, start=0, end=None):
     """
     Load multiple .pkl files and convert obs/next_obs to essential vectors.
+    Process files from the given start to end indices.
     Return everything as concatenated np arrays.
 
     Args:
-        file_paths (list): list of paths to .pkl files
+        file_paths (list): List of paths to .pkl files.
+        start (int): Start index of the file_paths list to process.
+        end (int): End index of the file_paths list to process.
 
     Returns:
         tuple of np.ndarray: (observations, rewards, actions, dones, next_observations)
@@ -128,6 +131,9 @@ def load_from_multiple_pkl_as_numpy(file_paths):
     all_rewards = []
     all_actions = []
     all_dones = []
+
+    # Slice the file_paths list based on start and end
+    file_paths = file_paths[start:end]
 
     for file_path in file_paths:
         print(file_path)

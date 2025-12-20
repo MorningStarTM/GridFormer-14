@@ -1,3 +1,4 @@
+import json
 import torch
 import torch.nn as nn
 import math
@@ -297,6 +298,13 @@ class GridFormerTrainer:
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config['lr'])
         self.loss_fn = nn.MSELoss()  # MSE for continuous next_obs and reward
 
+        self.epoch_losses = {
+            'loss_obs': [],
+            'loss_reward': [],
+            'loss_done': [],
+            'total_loss': []
+        }
+
         # Make sure weight dir exists
         Path(config['model_dir']).mkdir(parents=True, exist_ok=True)
 
@@ -305,6 +313,8 @@ class GridFormerTrainer:
         self.start_epoch = 0
         if config.get('preload', None):
             self._load_checkpoint(config['preload'])
+
+        os.makedirs("result", exist_ok=True)
 
     def _load_checkpoint(self, ckpt_path):
         if os.path.exists(ckpt_path):
@@ -341,6 +351,11 @@ class GridFormerTrainer:
 
                 loss = loss_obs + loss_rew + loss_done
 
+                self.epoch_losses['loss_obs'].append(loss_obs.item())
+                self.epoch_losses['loss_reward'].append(loss_rew.item())
+                self.epoch_losses['loss_done'].append(loss_done.item())
+                self.epoch_losses['total_loss'].append(loss.item())
+
                 self.writer.add_scalar('train/loss_obs', loss_obs.item(), self.global_step)
                 self.writer.add_scalar('train/loss_reward', loss_rew.item(), self.global_step)
                 self.writer.add_scalar('train/loss_done', loss_done.item(), self.global_step)
@@ -368,6 +383,8 @@ class GridFormerTrainer:
                 'global_step': self.global_step
             }, save_path)
             logger.info(f"Model saved at: {save_path}")
+            with open(os.path.join("result", 'losses.json'), 'w') as f:
+                json.dump(self.epoch_losses, f)
 
 
     def evaluate(self):

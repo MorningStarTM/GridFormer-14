@@ -112,16 +112,16 @@ def extract_essential_obs(obs_dict: dict):
 
 
 
-def load_from_multiple_pkl_as_numpy(file_paths, start=0, end=None):
+def load_from_multiple_pkl_as_numpy(folder_path, start=0, end=None):
     """
-    Load multiple .pkl files and convert obs/next_obs to essential vectors.
+    Load multiple .pkl files from a folder and convert obs/next_obs to essential vectors.
     Process files from the given start to end indices.
     Return everything as concatenated np arrays.
 
     Args:
-        file_paths (list): List of paths to .pkl files.
-        start (int): Start index of the file_paths list to process.
-        end (int): End index of the file_paths list to process.
+        folder_path (str): Path to the folder containing .pkl files.
+        start (int): Start index of the files to process.
+        end (int): End index of the files to process.
 
     Returns:
         tuple of np.ndarray: (observations, rewards, actions, dones, next_observations)
@@ -132,24 +132,34 @@ def load_from_multiple_pkl_as_numpy(file_paths, start=0, end=None):
     all_actions = []
     all_dones = []
 
+    # List all .pkl files in the folder and sort them
+    file_paths = sorted([os.path.join(folder_path, f) for f in os.listdir(folder_path) if f.endswith('.pkl')])
+
     # Slice the file_paths list based on start and end
     file_paths = file_paths[start:end]
 
     for file_path in file_paths:
-        print(file_path)
+        print(f"Processing file: {file_path}")
         with open(file_path, 'rb') as f:
             data = dill.load(f)
 
-        for ob, nob in zip(data['obs'], data['next_obs']):
+        # Extract data using the correct keys
+        obs_data = data.get('obs_data', [])
+        obs_next_data = data.get('obs_next_data', [])
+        reward_data = data.get('reward_data', [])
+        action_data = data.get('action_data', [])
+        done_data = data.get('done_data', [])
+
+        for ob, nob in zip(obs_data, obs_next_data):
             ob_dict = ob.to_dict() if hasattr(ob, 'to_dict') else ob
             nob_dict = nob.to_dict() if hasattr(nob, 'to_dict') else nob
 
             all_obs.append(filter_relevant_features(ob_dict))
             all_next_obs.append(filter_relevant_features(nob_dict))
 
-        all_rewards.extend(data['rewards'])
-        all_actions.extend(data['actions'])
-        all_dones.extend(data['done'])
+        all_rewards.extend(reward_data)
+        all_actions.extend(action_data)
+        all_dones.extend(done_data)
 
     # Convert to NumPy arrays
     obs = np.array(all_obs, dtype=np.float32)

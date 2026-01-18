@@ -273,13 +273,31 @@ def load_observation(folder_path, start=0, end=100):
     return observations
 
 
+class WMDataset(Dataset):
+    def __init__(self, observations, rewards, actions, dones, next_observations, seq_len, device):
+        self.seq_len = seq_len
+        self.device = device
 
-class ObsDataset(Dataset):
-    def __init__(self, observations, device):
-        self.observations = torch.tensor(np.array(observations, np.float32), dtype=torch.float32, device=device)
-        
+        # Convert to tensors first
+        self.observations = torch.tensor(np.array(observations, np.float32), dtype=torch.float32)
+        self.rewards = torch.tensor(np.array(rewards, np.float32), dtype=torch.float32)
+        self.actions = torch.tensor(np.array(actions, np.float32), dtype=torch.float32)  # One-hot or continuous
+        self.dones = torch.tensor(np.array(dones, np.float32), dtype=torch.float32)
+        self.next_observations = torch.tensor(np.array(next_observations, np.float32), dtype=torch.float32)
+
     def __len__(self):
-        return len(self.observations)
+        return len(self.observations) - self.seq_len
     
     def __getitem__(self, idx):
-        return (self.observations[idx])
+        obs_seq = self.observations[idx:idx+self.seq_len]                 # (T, state_dim)
+        act_seq = self.actions[idx:idx+self.seq_len].long()               # (T,) action ids
+
+        next_obs_seq = self.next_observations[idx:idx+self.seq_len]       # (T, state_dim) = (s1..sT)
+        reward_seq   = self.rewards[idx:idx+self.seq_len].unsqueeze(-1)   # (T, 1)
+        done_seq     = self.dones[idx:idx+self.seq_len].unsqueeze(-1)     # (T, 1)
+
+        return (obs_seq.to(self.device),
+                act_seq.to(self.device),
+                reward_seq.to(self.device),
+                done_seq.to(self.device),
+                next_obs_seq.to(self.device))

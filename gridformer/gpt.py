@@ -5,6 +5,7 @@ import torch.optim as optim
 import os
 import numpy as np
 from collections import deque
+from gridformer.Utils.logger import logger
 
 
 
@@ -118,17 +119,11 @@ class WMGPT(nn.Module):
         act_emb = self.action_embedding(action)
 
         fused = torch.cat((obs_emb, act_emb), dim=-1)
-        print(f"fused shape: {fused.shape}")
         token = self.traj_embedding(fused)
-        print(f"token shape: {token.shape}")
         pos = self.time_embedding(torch.tensor(step, dtype=torch.long, device=self.device))
-        print(f"pos shape: {pos.shape}")
         x = token + pos
-        print(f"x shape before blocks: {x.shape}")
         x = self.blocks(x)
-        print(f"x shape after blocks: {x.shape}")
         x = self.ln_f(x)
-        print(f"x shape after ln_f: {x.shape}")
 
         obs_logits = self.obs_head(x)
         reward_logits = self.reward_head(x)
@@ -171,4 +166,42 @@ class WMGPT(nn.Module):
                     if torch.is_tensor(v):
                         state[k] = v.to(device)
 
-        print(f"Loaded model from {path}.")
+        logger.info(f"Loaded model from {path}.")
+
+
+
+
+class WMTrainer:
+    def __init__(self, config):
+        self.model = WMGPT(config)
+        self.device = self.model.device
+        self.model.to(self.device)
+
+    
+
+    def train(self, dataloader):
+        self.model.train()
+        total_loss = 0
+        for batch in dataloader:
+            obs = batch['obs'].to(self.device)           # (B, T, state_dim)
+            action = batch['action'].to(self.device)     # (B, T)
+            reward = batch['reward'].to(self.device)     # (B, T, 1)
+            done = batch['done'].to(self.device)         # (B, T, 1)
+            step = batch['step'].to(self.device)         # (B, T)
+
+            obs_pred, reward_pred, done_pred = self.model(obs, action, step)
+
+            loss_obs = F.mse_loss(obs_pred, obs)
+            loss_reward = F.mse_loss(reward_pred, reward)
+            loss_done = F.binary_cross_entropy_with_logits(done_pred, done)
+
+            loss = loss_obs + loss_reward + loss_done
+
+            self.model.optimizer.zero_grad()
+            loss.backward()
+            self.model.optimizer.step()
+
+            total_loss += loss.item()
+
+        avg_loss = total_loss / len(dataloader)
+        return avg_loss

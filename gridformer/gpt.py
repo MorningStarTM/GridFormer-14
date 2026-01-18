@@ -98,6 +98,7 @@ class WMGPT(nn.Module):
         self.reward_head = nn.Linear(self.config['n_embd'], 1)
         self.done_head = nn.Linear(self.config['n_embd'], 1)
 
+        self.optimizer = optim.AdamW(self.parameters(), lr=self.config['learning_rate'])
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.apply(self._init_weights)
 
@@ -135,3 +136,39 @@ class WMGPT(nn.Module):
 
 
         return obs_logits, reward_logits, done_logits
+    
+
+
+    def save(self, path: str):
+        """
+        Save model + (optional) optimizer + config.
+        """
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        ckpt = {
+            "model_state_dict": self.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "config": self.config
+        }
+        torch.save(ckpt, path)
+
+    def load(self, path: str, device=None):
+        if device is None:
+            device = next(self.parameters()).device
+
+        ckpt = torch.load(path, map_location=device)
+
+        # Optional safety check: config match
+        if "config" in ckpt and ckpt["config"] != self.config:
+            raise ValueError("Checkpoint config != current model config (create model with same config before load).")
+
+        self.load_state_dict(ckpt["model_state_dict"])
+
+        if hasattr(self, "optimizer") and self.optimizer is not None and ckpt.get("optimizer_state_dict") is not None:
+            self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            # move optimizer state tensors to device
+            for state in self.optimizer.state.values():
+                for k, v in state.items():
+                    if torch.is_tensor(v):
+                        state[k] = v.to(device)
+
+        print(f"Loaded model from {path}.")

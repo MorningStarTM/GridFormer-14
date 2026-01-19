@@ -178,7 +178,45 @@ class WMTrainer:
         self.model.to(self.device)
 
     
+    def symlog(x: torch.Tensor) -> torch.Tensor:
+        return torch.sign(x) * torch.log1p(torch.abs(x))
 
+    def two_hot_targets(x_symlog: torch.Tensor, bin_centers: torch.Tensor) -> torch.Tensor:
+        """
+        x_symlog: (B,T,1) in symlog space
+        bin_centers: (K,) sorted ascending (symlog space)
+        returns: (B,T,K) two-hot soft target distribution
+        """
+        x = x_symlog.squeeze(-1)  # (B,T)
+        K = bin_centers.shape[0]
+
+        # find where x would be inserted
+        idx = torch.searchsorted(bin_centers, x.clamp(bin_centers[0], bin_centers[-1]))
+        idx = idx.clamp(1, K - 1)
+
+        lo = idx - 1
+        hi = idx
+
+        lo_c = bin_centers[lo]  # (B,T)
+        hi_c = bin_centers[hi]  # (B,T)
+
+        hi_w = (x - lo_c) / (hi_c - lo_c + 1e-8)
+        lo_w = 1.0 - hi_w
+
+        target = torch.zeros(x.shape[0], x.shape[1], K, device=x.device, dtype=torch.float32)
+        target.scatter_(2, lo.unsqueeze(-1), lo_w.unsqueeze(-1))
+        target.scatter_(2, hi.unsqueeze(-1), hi_w.unsqueeze(-1))
+        return target
+
+    def soft_ce_loss(logits: torch.Tensor, target_dist: torch.Tensor) -> torch.Tensor:
+        """
+        logits: (B,T,K)
+        target_dist: (B,T,K), sums to 1
+        """
+        logp = F.log_softmax(logits, dim=-1)
+        return -(target_dist * logp).sum(dim=-1).mean()
+    
+    
     def train(self, dataloader):
         self.model.train()
         total_loss = 0

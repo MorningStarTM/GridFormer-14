@@ -177,11 +177,14 @@ class WMTrainer:
         self.device = self.model.device
         self.model.to(self.device)
 
+        self.num_reward_bins = 255
+        self.reward_bins = torch.linspace(-6.0, 6.0, self.num_reward_bins, device=self.device)
+
     
-    def symlog(x: torch.Tensor) -> torch.Tensor:
+    def symlog(self, x: torch.Tensor) -> torch.Tensor:
         return torch.sign(x) * torch.log1p(torch.abs(x))
 
-    def two_hot_targets(x_symlog: torch.Tensor, bin_centers: torch.Tensor) -> torch.Tensor:
+    def two_hot_targets(self, x_symlog: torch.Tensor, bin_centers: torch.Tensor) -> torch.Tensor:
         """
         x_symlog: (B,T,1) in symlog space
         bin_centers: (K,) sorted ascending (symlog space)
@@ -208,7 +211,7 @@ class WMTrainer:
         target.scatter_(2, hi.unsqueeze(-1), hi_w.unsqueeze(-1))
         return target
 
-    def soft_ce_loss(logits: torch.Tensor, target_dist: torch.Tensor) -> torch.Tensor:
+    def soft_ce_loss(self, logits: torch.Tensor, target_dist: torch.Tensor) -> torch.Tensor:
         """
         logits: (B,T,K)
         target_dist: (B,T,K), sums to 1
@@ -216,7 +219,7 @@ class WMTrainer:
         logp = F.log_softmax(logits, dim=-1)
         return -(target_dist * logp).sum(dim=-1).mean()
     
-    
+
     def train(self, dataloader):
         self.model.train()
         total_loss = 0
@@ -230,7 +233,10 @@ class WMTrainer:
             obs_pred, reward_pred, done_pred = self.model(obs, action, step)
 
             loss_obs = F.mse_loss(obs_pred, obs)
-            loss_reward = F.mse_loss(reward_pred, reward)
+            reward_symlog = self.symlog(reward)  # (B,T,1)
+            reward_target_dist = self.two_hot_targets(reward_symlog, self.reward_bins)  # (B,T,K)
+            loss_reward = self.soft_ce_loss(reward_pred, reward_target_dist)
+
             loss_done = F.binary_cross_entropy_with_logits(done_pred, done)
 
             loss = loss_obs + loss_reward + loss_done
@@ -241,5 +247,5 @@ class WMTrainer:
 
             total_loss += loss.item()
 
-        avg_loss = total_loss / len(dataloader)
-        return avg_loss
+        return total_loss / len(dataloader)
+        

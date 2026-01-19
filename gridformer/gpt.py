@@ -96,7 +96,7 @@ class WMGPT(nn.Module):
 
         self.ln_f = nn.LayerNorm(self.config['n_embd'])
         self.obs_head = nn.Linear(self.config['n_embd'], config['input_dim'])
-        self.reward_head = nn.Linear(self.config['n_embd'], 1)
+        self.reward_head = nn.Linear(self.config['n_embd'], self.config['num_reward_bins'])
         self.done_head = nn.Linear(self.config['n_embd'], 1)
 
         self.optimizer = optim.AdamW(self.parameters(), lr=self.config['learning_rate'])

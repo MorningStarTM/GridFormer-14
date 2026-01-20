@@ -253,51 +253,106 @@ class GrdiDataset(Dataset):
 
 
 
-def load_observation(folder_path, start=0, end=100):
-    all_observations = []
+def load_from_multiple_pkl_as_numpy_with_steps(
+    folder_path,
+    start=0,
+    end=None,
+    step_cycle=8064,   # steps 0..8063
+):
+    """
+    Load multiple .pkl files from a folder and convert obs/next_obs to essential vectors.
+    Adds a 'steps' array that cycles [0..step_cycle-1] across the entire concatenated dataset.
 
-    
-    folder = os.listdir(folder_path)
-    # Iterate through all .npz files in the folder
-    for filename in folder[start:end]:
-        if filename.endswith(".npz"):
-            file_path = os.path.join(folder_path, filename)
-            npz_data = np.load(file_path, allow_pickle=True)
-            
-            all_observations.append(npz_data['obs'])
-    
+    Returns:
+        (obs, rewards, actions, dones, next_obs, steps)
+    """
+    all_obs = []
+    all_next_obs = []
+    all_rewards = []
+    all_actions = []
+    all_dones = []
 
-    # Concatenate all arrays along the first axis (stacking the data)
-    observations = np.concatenate(all_observations, axis=0)
-    
-    return observations
+    file_paths = sorted([
+        os.path.join(folder_path, f)
+        for f in os.listdir(folder_path)
+        if f.endswith(".pkl")
+    ])[start:end]
+
+    for file_path in file_paths:
+        print(f"Processing file: {file_path}")
+        with open(file_path, "rb") as f:
+            data = dill.load(f)
+
+        obs_data = data.get("obs_data", [])
+        obs_next_data = data.get("obs_next_data", [])
+        reward_data = data.get("reward_data", [])
+        action_data = data.get("action_data", [])
+        done_data = data.get("done_data", [])
+
+        for ob, nob in zip(obs_data, obs_next_data):
+            ob_dict = ob.to_dict() if hasattr(ob, "to_dict") else ob
+            nob_dict = nob.to_dict() if hasattr(nob, "to_dict") else nob
+
+            all_obs.append(filter_relevant_features(ob_dict))
+            all_next_obs.append(filter_relevant_features(nob_dict))
+
+        all_rewards.extend(reward_data)
+        all_actions.extend(action_data)
+        all_dones.extend(done_data)
+
+    obs = np.array(all_obs, dtype=np.float32)
+    next_obs = np.array(all_next_obs, dtype=np.float32)
+    rewards = np.array(all_rewards, dtype=np.float32)
+    actions = np.array(all_actions, dtype=np.int32)
+    dones = np.array(all_dones, dtype=np.float32)
+
+    # steps: 0..8063 repeated across entire dataset length
+    n = len(obs)
+    steps = (np.arange(n, dtype=np.int32) % step_cycle)
+
+    # sanity check
+    if not (len(rewards) == len(actions) == len(dones) == len(next_obs) == len(steps) == n):
+        raise ValueError("Length mismatch in loaded arrays.")
+
+    return obs, rewards, actions, dones, next_obs, steps
+
+
+
+
 
 
 class WMDataset(Dataset):
-    def __init__(self, observations, rewards, actions, dones, next_observations, seq_len, device):
+    def __init__(self, observations, rewards, actions, dones, next_observations, steps, seq_len, device):
         self.seq_len = seq_len
         self.device = device
 
-        # Convert to tensors first
-        self.observations = torch.tensor(np.array(observations, np.float32), dtype=torch.float32)
-        self.rewards = torch.tensor(np.array(rewards, np.float32), dtype=torch.float32)
-        self.actions = torch.tensor(np.array(actions, np.float32), dtype=torch.float32)  # One-hot or continuous
-        self.dones = torch.tensor(np.array(dones, np.float32), dtype=torch.float32)
-        self.next_observations = torch.tensor(np.array(next_observations, np.float32), dtype=torch.float32)
+        self.observations = torch.tensor(np.asarray(observations, np.float32), dtype=torch.float32)
+        self.rewards = torch.tensor(np.asarray(rewards, np.float32), dtype=torch.float32)
+        self.actions = torch.tensor(np.asarray(actions, np.int64), dtype=torch.long)   # action ids
+        self.dones = torch.tensor(np.asarray(dones, np.float32), dtype=torch.float32)
+        self.next_observations = torch.tensor(np.asarray(next_observations, np.float32), dtype=torch.float32)
+        self.steps = torch.tensor(np.asarray(steps, np.int32), dtype=torch.long)       # step ids 0..8063
+
+        n = len(self.observations)
+        if not (len(self.rewards) == len(self.actions) == len(self.dones) == len(self.next_observations) == len(self.steps) == n):
+            raise ValueError("Length mismatch in dataset inputs.")
 
     def __len__(self):
         return len(self.observations) - self.seq_len
-    
+
     def __getitem__(self, idx):
-        obs_seq = self.observations[idx:idx+self.seq_len]                 # (T, state_dim)
-        act_seq = self.actions[idx:idx+self.seq_len].long()               # (T,) action ids
+        obs_seq      = self.observations[idx:idx+self.seq_len]                 # (T, state_dim)
+        act_seq      = self.actions[idx:idx+self.seq_len]                      # (T,)
+        next_obs_seq = self.next_observations[idx:idx+self.seq_len]            # (T, state_dim)
+        reward_seq   = self.rewards[idx:idx+self.seq_len].unsqueeze(-1)        # (T, 1)
+        done_seq     = self.dones[idx:idx+self.seq_len].unsqueeze(-1)          # (T, 1)
+        steps_seq    = self.steps[idx:idx+self.seq_len]                        # (T,) in 0..8063
 
-        next_obs_seq = self.next_observations[idx:idx+self.seq_len]       # (T, state_dim) = (s1..sT)
-        reward_seq   = self.rewards[idx:idx+self.seq_len].unsqueeze(-1)   # (T, 1)
-        done_seq     = self.dones[idx:idx+self.seq_len].unsqueeze(-1)     # (T, 1)
-
-        return (obs_seq.to(self.device),
-                act_seq.to(self.device),
-                reward_seq.to(self.device),
-                done_seq.to(self.device),
-                next_obs_seq.to(self.device))
+        return (
+            obs_seq.to(self.device),
+            act_seq.to(self.device),
+            reward_seq.to(self.device),
+            done_seq.to(self.device),
+            next_obs_seq.to(self.device),
+            steps_seq.to(self.device),
+        )

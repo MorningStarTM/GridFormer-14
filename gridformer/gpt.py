@@ -1,3 +1,4 @@
+# gpt architecture for world model
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -120,7 +121,9 @@ class WMGPT(nn.Module):
 
         fused = torch.cat((obs_emb, act_emb), dim=-1)
         token = self.traj_embedding(fused)
-        pos = self.time_embedding(torch.tensor(step, dtype=torch.long, device=self.device))
+        step = step.to(obs.device).long()                   # (B,T) long on same device
+        step = step % self.config['max_timestep']           # safety (even if you already cycle)
+        pos = self.time_embedding(step)
         x = token + pos
         x = self.blocks(x)
         x = self.ln_f(x)
@@ -220,32 +223,128 @@ class WMTrainer:
         return -(target_dist * logp).sum(dim=-1).mean()
     
 
-    def train(self, dataloader):
-        self.model.train()
-        total_loss = 0
-        for batch in dataloader:
-            obs = batch['obs'].to(self.device)           # (B, T, state_dim)
-            action = batch['action'].to(self.device)     # (B, T)
-            reward = batch['reward'].to(self.device)     # (B, T, 1)
-            done = batch['done'].to(self.device)         # (B, T, 1)
-            step = batch['step'].to(self.device)         # (B, T)
 
-            obs_pred, reward_pred, done_pred = self.model(obs, action, step)
+    def train(self, train_loader, epochs=10, val_loader=None, log_every=1):
+        """
+        Train for multiple epochs.
 
-            loss_obs = F.mse_loss(obs_pred, obs)
-            reward_symlog = self.symlog(reward)  # (B,T,1)
-            reward_target_dist = self.two_hot_targets(reward_symlog, self.reward_bins)  # (B,T,K)
-            loss_reward = self.soft_ce_loss(reward_pred, reward_target_dist)
+        Args:
+            train_loader: DataLoader for training
+            epochs (int): number of epochs
+            val_loader: optional DataLoader for validation
+            log_every (int): print every N epochs
 
-            loss_done = F.binary_cross_entropy_with_logits(done_pred, done)
+        Returns:
+            dict: {"train_loss": [...], "val_loss": [...] (if val_loader provided)}
+        """
+        history = {"train_loss": []}
+        if val_loader is not None:
+            history["val_loss"] = []
 
-            loss = loss_obs + loss_reward + loss_done
+        max_t = self.model.config["max_timestep"]
+        act_n = self.model.config["action_size"]
 
-            self.model.optimizer.zero_grad()
-            loss.backward()
-            self.model.optimizer.step()
+        for ep in range(1, epochs + 1):
+            # -------- TRAIN --------
+            self.model.train()
+            total_loss = 0.0
+            n_batches = 0
 
-            total_loss += loss.item()
+            for batch in train_loader:
+                obs, action, reward, done, next_obs, step = batch
 
-        return total_loss / len(dataloader)
-        
+                # checks (CPU)
+                if step.max().item() >= max_t or step.min().item() < 0:
+                    raise ValueError(
+                        f"[epoch {ep}] step out of range: [{step.min().item()}, {step.max().item()}], max_timestep={max_t}"
+                    )
+                if action.max().item() >= act_n or action.min().item() < 0:
+                    raise ValueError(
+                        f"[epoch {ep}] action out of range: [{action.min().item()}, {action.max().item()}], action_size={act_n}"
+                    )
+
+                # move to device
+                obs = obs.to(self.device)
+                action = action.to(self.device)
+                reward = reward.to(self.device)
+                done = done.to(self.device)
+                next_obs = next_obs.to(self.device)
+                step = step.to(self.device)
+
+                # forward
+                obs_pred, reward_pred, done_pred = self.model(obs, action, step)
+
+                # losses
+                loss_obs = F.mse_loss(obs_pred, next_obs)
+
+                reward_symlog = self.symlog(reward)  # (B,T,1)
+                reward_target_dist = self.two_hot_targets(reward_symlog, self.reward_bins)  # (B,T,K)
+                loss_reward = self.soft_ce_loss(reward_pred, reward_target_dist)
+
+                loss_done = F.binary_cross_entropy_with_logits(done_pred, done)
+
+                loss = loss_obs + loss_reward + loss_done
+
+                # backward
+                self.model.optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                self.model.optimizer.step()
+
+                total_loss += float(loss.item())
+                n_batches += 1
+
+            train_loss = total_loss / max(n_batches, 1)
+            history["train_loss"].append(train_loss)
+
+            # -------- VAL  --------
+            if val_loader is not None:
+                self.model.eval()
+                val_total = 0.0
+                val_batches = 0
+
+                with torch.no_grad():
+                    for batch in val_loader:
+                        obs, action, reward, done, next_obs, step = batch
+
+                        # (checks optional in val, but keep them for safety)
+                        if step.max().item() >= max_t or step.min().item() < 0:
+                            raise ValueError(
+                                f"[val epoch {ep}] step out of range: [{step.min().item()}, {step.max().item()}], max_timestep={max_t}"
+                            )
+                        if action.max().item() >= act_n or action.min().item() < 0:
+                            raise ValueError(
+                                f"[val epoch {ep}] action out of range: [{action.min().item()}, {action.max().item()}], action_size={act_n}"
+                            )
+
+                        obs = obs.to(self.device)
+                        action = action.to(self.device)
+                        reward = reward.to(self.device)
+                        done = done.to(self.device)
+                        next_obs = next_obs.to(self.device)
+                        step = step.to(self.device)
+
+                        obs_pred, reward_pred, done_pred = self.model(obs, action, step)
+
+                        loss_obs = F.mse_loss(obs_pred, next_obs)
+                        reward_symlog = self.symlog(reward)
+                        reward_target_dist = self.two_hot_targets(reward_symlog, self.reward_bins)
+                        loss_reward = self.soft_ce_loss(reward_pred, reward_target_dist)
+                        loss_done = F.binary_cross_entropy_with_logits(done_pred, done)
+
+                        loss = loss_obs + loss_reward + loss_done
+
+                        val_total += float(loss.item())
+                        val_batches += 1
+
+                val_loss = val_total / max(val_batches, 1)
+                history["val_loss"].append(val_loss)
+
+            # -------- LOG --------
+            if (ep % log_every) == 0:
+                if val_loader is None:
+                    print(f"Epoch {ep}/{epochs} | train_loss: {train_loss:.6f}")
+                else:
+                    print(f"Epoch {ep}/{epochs} | train_loss: {train_loss:.6f} | val_loss: {val_loss:.6f}")
+
+        return history
+

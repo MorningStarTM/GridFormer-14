@@ -53,10 +53,10 @@ class DataGenerator:
 
                     next_obs, reward, done, _ = self.env.step(act)
 
-                    obs_data.append(obs)
+                    obs_data.append(obs.to_dict())
                     action_data.append(action)
                     reward_data.append(reward)
-                    next_obs_data.append(next_obs)
+                    next_obs_data.append(next_obs.to_dict())
                     done_data.append(done)
 
                     obs = next_obs

@@ -253,66 +253,133 @@ class GrdiDataset(Dataset):
 
 
 
+
 def load_from_multiple_pkl_as_numpy_with_steps(
     folder_path,
+    filter_fn=None,          # e.g., filter_relevant_features
     start=0,
     end=None,
-    step_cycle=8064,   # steps 0..8063
+    step_cycle=8064,         # steps 0..step_cycle-1
+    keys_map=None,           # optional: map your key names
+    verbose=True,
 ):
     """
-    Load multiple .pkl files from a folder and convert obs/next_obs to essential vectors.
-    Adds a 'steps' array that cycles [0..step_cycle-1] across the entire concatenated dataset.
+    Reads multiple episode_*.pkl files and returns:
+      (obs, rewards, actions, dones, next_obs, steps) as numpy arrays.
+
+    This version is compatible with your DataGenerator that saves keys:
+      "obs", "actions", "rewards", "next_obs", "done"
+
+    Args:
+        folder_path: directory containing .pkl files
+        filter_fn: function(dict)->vector. If None, tries best-effort flatten.
+        start/end: slice on sorted .pkl files
+        step_cycle: steps wrap-around period
+        keys_map: override default keys if your pkl uses different names, e.g.
+            {"obs":"obs_data","next_obs":"obs_next_data","rewards":"reward_data",
+             "actions":"action_data","done":"done_data"}
+        verbose: prints progress
 
     Returns:
-        (obs, rewards, actions, dones, next_obs, steps)
+        obs:      (N, D) float32
+        rewards:  (N,) float32
+        actions:  (N,) int32
+        dones:    (N,) float32
+        next_obs: (N, D) float32
+        steps:    (N,) int32
     """
-    all_obs = []
-    all_next_obs = []
-    all_rewards = []
-    all_actions = []
-    all_dones = []
+    # Default keys for YOUR DataGenerator
+    km = {
+        "obs": "obs",
+        "next_obs": "next_obs",
+        "rewards": "rewards",
+        "actions": "actions",
+        "done": "done",
+    }
+    if keys_map:
+        km.update(keys_map)
 
-    file_paths = sorted([
+    def _default_filter(ob_dict):
+        """
+        Best-effort: make a numeric 1D vector from a dict by concatenating
+        any numpy-like / list-like numeric values found.
+        (Recommended: pass your own filter_relevant_features instead.)
+        """
+        vals = []
+        for v in ob_dict.values():
+            if isinstance(v, (int, float, bool, np.number)):
+                vals.append(np.array([v], dtype=np.float32))
+            elif isinstance(v, (list, tuple, np.ndarray)):
+                arr = np.asarray(v)
+                if arr.dtype.kind in "iufb":  # numeric/bool
+                    vals.append(arr.astype(np.float32).ravel())
+        if not vals:
+            raise ValueError("No numeric features found in observation dict. Provide filter_fn.")
+        return np.concatenate(vals, axis=0)
+
+    if filter_fn is None:
+        filter_fn = _default_filter
+
+    # collect
+    all_obs, all_next_obs = [], []
+    all_rewards, all_actions, all_dones = [], [], []
+
+    file_paths = sorted(
         os.path.join(folder_path, f)
         for f in os.listdir(folder_path)
         if f.endswith(".pkl")
-    ])[start:end]
+    )[start:end]
 
-    for file_path in file_paths:
-        print(f"Processing file: {file_path}")
-        with open(file_path, "rb") as f:
+    if not file_paths:
+        raise FileNotFoundError(f"No .pkl files found in: {folder_path}")
+
+    for fp in file_paths:
+        if verbose:
+            print(f"Processing file: {fp}")
+
+        with open(fp, "rb") as f:
             data = dill.load(f)
 
-        obs_data = data.get("obs_data", [])
-        obs_next_data = data.get("obs_next_data", [])
-        reward_data = data.get("reward_data", [])
-        action_data = data.get("action_data", [])
-        done_data = data.get("done_data", [])
+        obs_seq = data.get(km["obs"], [])
+        next_obs_seq = data.get(km["next_obs"], [])
+        rewards_seq = data.get(km["rewards"], [])
+        actions_seq = data.get(km["actions"], [])
+        dones_seq = data.get(km["done"], [])
 
-        for ob, nob in zip(obs_data, obs_next_data):
+        # sanity: sequence lengths should match (at least for obs/next_obs)
+        m = min(len(obs_seq), len(next_obs_seq), len(rewards_seq), len(actions_seq), len(dones_seq))
+        if m == 0:
+            continue
+
+        # per-step
+        for i in range(m):
+            ob = obs_seq[i]
+            nob = next_obs_seq[i]
+
             ob_dict = ob.to_dict() if hasattr(ob, "to_dict") else ob
             nob_dict = nob.to_dict() if hasattr(nob, "to_dict") else nob
 
-            all_obs.append(filter_relevant_features(ob_dict))
-            all_next_obs.append(filter_relevant_features(nob_dict))
+            all_obs.append(filter_fn(ob_dict))
+            all_next_obs.append(filter_fn(nob_dict))
 
-        all_rewards.extend(reward_data)
-        all_actions.extend(action_data)
-        all_dones.extend(done_data)
+        all_rewards.extend(rewards_seq[:m])
+        all_actions.extend(actions_seq[:m])
+        all_dones.extend(dones_seq[:m])
 
-    obs = np.array(all_obs, dtype=np.float32)
-    next_obs = np.array(all_next_obs, dtype=np.float32)
-    rewards = np.array(all_rewards, dtype=np.float32)
-    actions = np.array(all_actions, dtype=np.int32)
-    dones = np.array(all_dones, dtype=np.float32)
+    obs = np.asarray(all_obs, dtype=np.float32)
+    next_obs = np.asarray(all_next_obs, dtype=np.float32)
+    rewards = np.asarray(all_rewards, dtype=np.float32)
+    actions = np.asarray(all_actions, dtype=np.int32)
+    dones = np.asarray(all_dones, dtype=np.float32)
 
-    # steps: 0..8063 repeated across entire dataset length
     n = len(obs)
     steps = (np.arange(n, dtype=np.int32) % step_cycle)
 
-    # sanity check
     if not (len(rewards) == len(actions) == len(dones) == len(next_obs) == len(steps) == n):
-        raise ValueError("Length mismatch in loaded arrays.")
+        raise ValueError(
+            f"Length mismatch: obs={len(obs)}, next_obs={len(next_obs)}, "
+            f"rewards={len(rewards)}, actions={len(actions)}, dones={len(dones)}, steps={len(steps)}"
+        )
 
     return obs, rewards, actions, dones, next_obs, steps
 

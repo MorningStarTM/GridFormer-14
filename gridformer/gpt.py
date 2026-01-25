@@ -402,6 +402,15 @@ class WMTrainer:
         if val_loader is not None:
             history["val_loss"] = []
 
+        history["train_loss_obs"] = []
+        history["train_loss_reward"] = []
+        history["train_loss_done"] = []
+
+        if val_loader is not None:
+            history["val_loss_obs"] = []
+            history["val_loss_reward"] = []
+            history["val_loss_done"] = []
+
         max_t = self.model.config["max_timestep"]
         act_n = self.model.config["action_size"]
         best_metric = math.inf          # lower is better
@@ -415,6 +424,9 @@ class WMTrainer:
             self.model.train()
             total_loss = 0.0
             n_batches = 0
+            total_loss_obs = 0.0
+            total_loss_reward = 0.0
+            total_loss_done = 0.0
 
             for batch in train_loader:
                 obs, action, reward, done, next_obs, step = batch
@@ -450,6 +462,9 @@ class WMTrainer:
                 loss_done = F.binary_cross_entropy_with_logits(done_pred, done)
 
                 loss = loss_obs + loss_reward + loss_done
+                total_loss_obs += float(loss_obs.item())
+                total_loss_reward += float(loss_reward.item())
+                total_loss_done += float(loss_done.item())
 
                 # backward
                 self.model.optimizer.zero_grad(set_to_none=True)
@@ -460,6 +475,15 @@ class WMTrainer:
                 n_batches += 1
 
             train_loss = total_loss / max(n_batches, 1)
+            train_loss_obs = total_loss_obs / max(n_batches, 1)
+            train_loss_reward = total_loss_reward / max(n_batches, 1)
+            train_loss_done = total_loss_done / max(n_batches, 1)
+
+            history["train_loss_obs"].append(train_loss_obs)
+            history["train_loss_reward"].append(train_loss_reward)
+            history["train_loss_done"].append(train_loss_done)
+
+
             history["train_loss"].append(train_loss)
 
             # -------- VAL  --------
@@ -467,6 +491,9 @@ class WMTrainer:
                 self.model.eval()
                 val_total = 0.0
                 val_batches = 0
+                val_total_obs = 0.0
+                val_total_reward = 0.0
+                val_total_done = 0.0
 
                 with torch.no_grad():
                     for batch in val_loader:
@@ -499,10 +526,21 @@ class WMTrainer:
 
                         loss = loss_obs + loss_reward + loss_done
 
+                        val_total_obs += float(loss_obs.item())
+                        val_total_reward += float(loss_reward.item())
+                        val_total_done += float(loss_done.item())
+
                         val_total += float(loss.item())
                         val_batches += 1
 
                 val_loss = val_total / max(val_batches, 1)
+                val_loss_obs = val_total_obs / max(val_batches, 1)
+                val_loss_reward = val_total_reward / max(val_batches, 1)
+                val_loss_done = val_total_done / max(val_batches, 1)
+
+                history["val_loss_obs"].append(val_loss_obs)
+                history["val_loss_reward"].append(val_loss_reward)
+                history["val_loss_done"].append(val_loss_done)
                 history["val_loss"].append(val_loss)
             
             current_metric = val_loss if (val_loader is not None) else train_loss
@@ -522,9 +560,17 @@ class WMTrainer:
             # -------- LOG --------
             if (ep % log_every) == 0:
                 if val_loader is None:
-                    logger.info(f"Epoch {ep}/{epochs} | train_loss: {train_loss:.6f}")
+                    logger.info(
+                            f"Epoch {ep}/{epochs} | "
+                            f"train: total={train_loss:.6f} obs={train_loss_obs:.6f} rew={train_loss_reward:.6f} done={train_loss_done:.6f}"
+                        )
+
                 else:
-                    logger.info(f"Epoch {ep}/{epochs} | train_loss: {train_loss:.6f} | val_loss: {val_loss:.6f}")
+                    logger.info(
+                            f"Epoch {ep}/{epochs} | "
+                            f"train: total={train_loss:.6f} obs={train_loss_obs:.6f} rew={train_loss_reward:.6f} done={train_loss_done:.6f} | "
+                            f"val: total={val_loss:.6f} obs={val_loss_obs:.6f} rew={val_loss_reward:.6f} done={val_loss_done:.6f}"
+                        )
 
         return history
 

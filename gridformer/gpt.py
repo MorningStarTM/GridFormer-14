@@ -1,4 +1,5 @@
 # gpt architecture for world model
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -403,6 +404,11 @@ class WMTrainer:
 
         max_t = self.model.config["max_timestep"]
         act_n = self.model.config["action_size"]
+        best_metric = math.inf          # lower is better
+        best_epoch = 0
+        patience = 10
+        bad_epochs = 0
+        best_path = getattr(self, "best_ckpt_path", None) or "checkpoints/best_model"
 
         for ep in range(1, epochs + 1):
             # -------- TRAIN --------
@@ -498,13 +504,27 @@ class WMTrainer:
 
                 val_loss = val_total / max(val_batches, 1)
                 history["val_loss"].append(val_loss)
+            
+            current_metric = val_loss if (val_loader is not None) else train_loss
+            if current_metric < (best_metric - 1e-8):
+                best_metric = current_metric
+                best_epoch = ep
+                bad_epochs = 0
+                self.model.save_safetensors(best_path)
+                logger.info(f"[ckpt] saved best at epoch {ep}: metric={best_metric:.6f} -> {best_path}")
+
+            else:
+                bad_epochs += 1
+                if bad_epochs >= patience:
+                    logger.info(f"[early stop] no improvement for {patience} epochs. best_epoch={best_epoch}, best_metric={best_metric:.6f}")
+                    break
 
             # -------- LOG --------
             if (ep % log_every) == 0:
                 if val_loader is None:
-                    print(f"Epoch {ep}/{epochs} | train_loss: {train_loss:.6f}")
+                    logger.info(f"Epoch {ep}/{epochs} | train_loss: {train_loss:.6f}")
                 else:
-                    print(f"Epoch {ep}/{epochs} | train_loss: {train_loss:.6f} | val_loss: {val_loss:.6f}")
+                    logger.info(f"Epoch {ep}/{epochs} | train_loss: {train_loss:.6f} | val_loss: {val_loss:.6f}")
 
         return history
 

@@ -4,9 +4,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import os
+import json
 import numpy as np
 from collections import deque
 from gridformer.Utils.logger import logger
+from gridformer.Utils.utils import _to_jsonable
+from safetensors.torch import save_file, load_file
 
 
 
@@ -170,6 +173,163 @@ class WMGPT(nn.Module):
                         state[k] = v.to(device)
 
         logger.info(f"Loaded model from {path}.")
+
+    
+
+
+    def save_safetensors(self, path: str, save_optimizer: bool = True):
+        """
+        Save model weights (always) + optimizer state tensors (optional) using safetensors.
+        Writes:
+          - {path}.safetensors
+          - {path}.json
+          - {path}.optim.safetensors   (optional)
+        """
+        base, ext = os.path.splitext(path)
+        if ext:  # user passed something like "ckpt.pt" -> use "ckpt"
+            base = base
+        os.makedirs(os.path.dirname(base) or ".", exist_ok=True)
+
+        model_path = base + ".safetensors"
+        meta_path = base + ".json"
+        optim_path = base + ".optim.safetensors"
+
+        # 1) model weights
+        model_sd = {k: v.detach().cpu() for k, v in self.state_dict().items()}
+        save_file(model_sd, model_path)
+
+        # 2) metadata (config + optimizer key structure)
+        meta = {
+            "format": "safetensors_ckpt_v1",
+            "config": _to_jsonable(getattr(self, "config", None)),
+            "has_optimizer": False,
+            "optimizer_state_keys": None,
+        }
+
+        # 3) optimizer (optional, best-effort)
+        if save_optimizer and hasattr(self, "optimizer") and self.optimizer is not None:
+            try:
+                opt_sd = self.optimizer.state_dict()
+
+                # Flatten ONLY tensor parts of optimizer state into a safetensors dict
+                # Key format: state/{param_idx}/{state_key}
+                # (We keep "param_groups" + non-tensor scalars in JSON)
+                opt_tensors = {}
+                opt_state_keys = {}  # helps debug / validate
+                for param_idx, st in opt_sd.get("state", {}).items():
+                    param_idx_str = str(param_idx)
+                    opt_state_keys[param_idx_str] = []
+                    for sk, sv in st.items():
+                        if torch.is_tensor(sv):
+                            key = f"state/{param_idx_str}/{sk}"
+                            opt_tensors[key] = sv.detach().cpu()
+                            opt_state_keys[param_idx_str].append(sk)
+
+                # Save optimizer tensor state
+                save_file(opt_tensors, optim_path)
+
+                # Save remaining optimizer info in metadata
+                meta["has_optimizer"] = True
+                meta["optimizer_state_keys"] = opt_state_keys
+                meta["optimizer_param_groups"] = _to_jsonable(opt_sd.get("param_groups", []))
+
+                # Also save non-tensor optimizer scalars per param (e.g., step counts if ints)
+                # We store them to JSON so load can restore if desired.
+                opt_state_nontensor = {}
+                for param_idx, st in opt_sd.get("state", {}).items():
+                    p = str(param_idx)
+                    opt_state_nontensor[p] = {}
+                    for sk, sv in st.items():
+                        if not torch.is_tensor(sv):
+                            opt_state_nontensor[p][sk] = _to_jsonable(sv)
+                meta["optimizer_state_nontensor"] = opt_state_nontensor
+
+            except Exception as e:
+                # If optimizer save fails, still save model + config
+                meta["has_optimizer"] = False
+                meta["optimizer_save_error"] = str(e)
+
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
+
+    def load_safetensors(self, path: str, device=None, load_optimizer: bool = True, strict: bool = True):
+        """
+        Load model weights (+ optional optimizer state) from safetensors-based checkpoint.
+        Expects:
+          - {path}.safetensors
+          - {path}.json
+          - {path}.optim.safetensors   (optional)
+        """
+        if device is None:
+            device = next(self.parameters()).device
+
+        base, ext = os.path.splitext(path)
+        if ext:
+            base = base
+
+        model_path = base + ".safetensors"
+        meta_path = base + ".json"
+        optim_path = base + ".optim.safetensors"
+
+        # metadata (optional but recommended)
+        meta = None
+        if os.path.exists(meta_path):
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+
+            # Optional safety check: config match
+            if meta.get("config") is not None and hasattr(self, "config"):
+                if meta["config"] != _to_jsonable(self.config):
+                    raise ValueError("Checkpoint config != current model config (create model with same config before load).")
+
+        # load model weights
+        model_sd = load_file(model_path)  # tensors on CPU
+        model_sd = {k: v.to(device) for k, v in model_sd.items()}
+        self.load_state_dict(model_sd, strict=strict)
+
+        # optimizer (best-effort)
+        if (
+            load_optimizer
+            and hasattr(self, "optimizer")
+            and self.optimizer is not None
+            and meta is not None
+            and meta.get("has_optimizer", False)
+            and os.path.exists(optim_path)
+        ):
+            try:
+                opt_sd = self.optimizer.state_dict()
+
+                # Restore param_groups from meta (structure)
+                if "optimizer_param_groups" in meta:
+                    opt_sd["param_groups"] = meta["optimizer_param_groups"]
+
+                # Restore non-tensor fields (if present)
+                if "optimizer_state_nontensor" in meta:
+                    for pidx, fields in meta["optimizer_state_nontensor"].items():
+                        pidx_int = int(pidx)
+                        if pidx_int not in opt_sd["state"]:
+                            opt_sd["state"][pidx_int] = {}
+                        opt_sd["state"][pidx_int].update(fields)
+
+                # Restore tensor fields from optim safetensors
+                opt_tensors = load_file(optim_path)  # CPU tensors
+                # Keys are state/{param_idx}/{state_key}
+                for key, tensor in opt_tensors.items():
+                    _, pidx, sk = key.split("/", 2)
+                    pidx_int = int(pidx)
+                    if pidx_int not in opt_sd["state"]:
+                        opt_sd["state"][pidx_int] = {}
+                    opt_sd["state"][pidx_int][sk] = tensor.to(device)
+
+                self.optimizer.load_state_dict(opt_sd)
+
+            except Exception as e:
+                # Don’t fail the whole load if optimizer restore breaks
+                # (torch version changes often break optimizer states)
+                if "logger" in globals():
+                    logger.warning(f"Loaded model but skipped optimizer restore due to: {e}")
+        if "logger" in globals():
+            logger.info(f"Loaded safetensors checkpoint from {base}.")
 
 
 

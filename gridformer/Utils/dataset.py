@@ -586,9 +586,13 @@ class WMDataset(Dataset):
 # scaler.update(new_next_observations)
 
 # IMPORTANT:
-# If you already trained a model with old scaling,
-# do NOT change scaling mid-training for the same model run.
-# Instead: update scaler while collecting -> then retrain / finetune with frozen scaler.
+# Load model checkpoint (from 50)
+
+# Load scaler v1 (from 50)
+
+# Do NOT update scaler
+
+# Train on new data normalized with scaler v1
 
 # state = scaler.state_dict()
 # np.save("wm_scaler.npy", state, allow_pickle=True)

@@ -388,21 +388,165 @@ def load_from_multiple_pkl_as_numpy_with_steps(
 
 
 
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+
+
+class RunningStandardScaler:
+    """
+    Streaming mean/std scaler (Welford-style merge) for feature-wise normalization.
+
+    Usage patterns:
+    1) Offline fit (current dataset):
+        scaler = RunningStandardScaler()
+        scaler.update(obs)
+        scaler.update(next_obs)
+
+    2) Streaming:
+        scaler.update(obs_batch)
+        scaler.update(next_obs_batch)
+        # later freeze and reuse same scaler
+
+    Save/load:
+        state = scaler.state_dict()
+        scaler.load_state_dict(state)
+    """
+    def __init__(self, eps=1e-8):
+        self.eps = eps
+        self.mean = None   # shape: (D,)
+        self.var = None    # shape: (D,)
+        self.count = 0
+
+    def update(self, x):
+        # x: (N, D) numpy or torch
+        if isinstance(x, torch.Tensor):
+            x_np = x.detach().cpu().numpy()
+        else:
+            x_np = np.asarray(x)
+
+        if x_np.ndim != 2:
+            raise ValueError(f"Expected x to have shape (N, D). Got {x_np.shape}.")
+
+        batch_count = x_np.shape[0]
+        if batch_count == 0:
+            return
+
+        batch_mean = x_np.mean(axis=0)
+        batch_var = x_np.var(axis=0)
+
+        if self.mean is None:
+            self.mean = batch_mean.astype(np.float64)
+            self.var = batch_var.astype(np.float64)
+            self.count = int(batch_count)
+            return
+
+        # Merge two sets of mean/var
+        old_count = self.count
+        new_count = old_count + batch_count
+
+        delta = batch_mean - self.mean
+        new_mean = self.mean + delta * (batch_count / new_count)
+
+        m_a = self.var * old_count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + (delta * delta) * (old_count * batch_count / new_count)
+
+        new_var = M2 / new_count
+
+        self.mean = new_mean
+        self.var = new_var
+        self.count = int(new_count)
+
+    def normalize(self, x, device=None, dtype=torch.float32):
+        """
+        Normalize x using current mean/std.
+        x can be numpy or torch. Returns torch.Tensor.
+        """
+        if self.mean is None or self.var is None or self.count == 0:
+            raise RuntimeError("Scaler has no stats. Call update() first or load_state_dict().")
+
+        if isinstance(x, torch.Tensor):
+            t = x
+        else:
+            t = torch.tensor(np.asarray(x, np.float32), dtype=dtype)
+
+        if device is not None:
+            t = t.to(device)
+
+        mean_t = torch.tensor(self.mean, dtype=dtype, device=t.device)
+        std_t = torch.sqrt(torch.tensor(self.var, dtype=dtype, device=t.device)) + self.eps
+        return (t - mean_t) / std_t
+
+    def state_dict(self):
+        return {
+            "eps": float(self.eps),
+            "mean": None if self.mean is None else self.mean.astype(np.float64),
+            "var": None if self.var is None else self.var.astype(np.float64),
+            "count": int(self.count),
+        }
+
+    def load_state_dict(self, state):
+        self.eps = float(state.get("eps", 1e-8))
+        mean = state.get("mean", None)
+        var = state.get("var", None)
+        self.mean = None if mean is None else np.asarray(mean, dtype=np.float64)
+        self.var = None if var is None else np.asarray(var, dtype=np.float64)
+        self.count = int(state.get("count", 0))
+
+
 class WMDataset(Dataset):
-    def __init__(self, observations, rewards, actions, dones, next_observations, steps, seq_len, device):
+    def __init__(
+        self,
+        observations,
+        rewards,
+        actions,
+        dones,
+        next_observations,
+        steps,
+        seq_len,
+        device,
+        scaler=None,
+        fit_scaler=False,
+        normalize_obs=True,
+    ):
+        """
+        scaler: RunningStandardScaler (shared for obs and next_obs)
+        fit_scaler: if True and scaler provided, updates scaler using observations + next_observations
+        normalize_obs: if True, applies scaler normalization to obs and next_obs tensors
+        """
         self.seq_len = seq_len
         self.device = device
+        self.scaler = scaler
 
-        self.observations = torch.tensor(np.asarray(observations, np.float32), dtype=torch.float32)
+        # Convert raw arrays to tensors (still on CPU initially)
+        obs_np = np.asarray(observations, np.float32)
+        next_obs_np = np.asarray(next_observations, np.float32)
+
         self.rewards = torch.tensor(np.asarray(rewards, np.float32), dtype=torch.float32)
-        self.actions = torch.tensor(np.asarray(actions, np.int64), dtype=torch.long)   # action ids
+        self.actions = torch.tensor(np.asarray(actions, np.int64), dtype=torch.long)
         self.dones = torch.tensor(np.asarray(dones, np.float32), dtype=torch.float32)
-        self.next_observations = torch.tensor(np.asarray(next_observations, np.float32), dtype=torch.float32)
-        self.steps = torch.tensor(np.asarray(steps, np.int32), dtype=torch.long)       # step ids 0..8063
+        self.steps = torch.tensor(np.asarray(steps, np.int32), dtype=torch.long)
 
-        n = len(self.observations)
-        if not (len(self.rewards) == len(self.actions) == len(self.dones) == len(self.next_observations) == len(self.steps) == n):
+        n = len(obs_np)
+        if not (len(self.rewards) == len(self.actions) == len(self.dones) == len(next_obs_np) == len(self.steps) == n):
             raise ValueError("Length mismatch in dataset inputs.")
+
+        # Optionally fit/update scaler using available data
+        if self.scaler is not None and fit_scaler:
+            self.scaler.update(obs_np)
+            self.scaler.update(next_obs_np)
+
+        # Apply normalization (IMPORTANT: same scaler for obs and next_obs)
+        if normalize_obs:
+            if self.scaler is None:
+                raise ValueError("normalize_obs=True but scaler=None. Provide a scaler or set normalize_obs=False.")
+
+            self.observations = self.scaler.normalize(obs_np, device=None)         # keep CPU for now
+            self.next_observations = self.scaler.normalize(next_obs_np, device=None)
+        else:
+            self.observations = torch.tensor(obs_np, dtype=torch.float32)
+            self.next_observations = torch.tensor(next_obs_np, dtype=torch.float32)
 
     def __len__(self):
         return len(self.observations) - self.seq_len
@@ -423,3 +567,32 @@ class WMDataset(Dataset):
             next_obs_seq.to(self.device),
             steps_seq.to(self.device),
         )
+
+
+
+#Usage example:
+# scaler = RunningStandardScaler()
+# scaler.update(observations)
+# scaler.update(next_observations)
+
+# train_ds = WMDataset(
+#     observations, rewards, actions, dones, next_observations, steps,
+#     seq_len=32, device=device,
+#     scaler=scaler, fit_scaler=False, normalize_obs=True
+# )
+
+
+# scaler.update(new_observations)
+# scaler.update(new_next_observations)
+
+# IMPORTANT:
+# If you already trained a model with old scaling,
+# do NOT change scaling mid-training for the same model run.
+# Instead: update scaler while collecting -> then retrain / finetune with frozen scaler.
+
+# state = scaler.state_dict()
+# np.save("wm_scaler.npy", state, allow_pickle=True)
+
+# Later:
+# state = np.load("wm_scaler.npy", allow_pickle=True).item()
+# scaler.load_state_dict(state)

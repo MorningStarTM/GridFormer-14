@@ -140,6 +140,17 @@ class WMGPT(nn.Module):
         return obs_logits, reward_logits, done_logits
     
 
+    def print_param_size(self):
+        """
+        Print total number of parameters in millions.
+        """
+        total_params = sum(p.numel() for p in self.parameters())
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+        logger.info(f"Total parameters      : {total_params / 1e6:.3f} M")
+        logger.info(f"Trainable parameters  : {trainable_params / 1e6:.3f} M")
+    
+
 
     def save(self, path: str):
         """
@@ -340,6 +351,7 @@ class WMTrainer:
         self.model = WMGPT(config)
         self.device = self.model.device
         self.model.to(self.device)
+        self.model.print_param_size()
 
         self.num_reward_bins = 255
         self.reward_bins = torch.linspace(-6.0, 6.0, self.num_reward_bins, device=self.device)

@@ -353,9 +353,10 @@ class WMTrainer:
         self.model.to(self.device)
         self.model.print_param_size()
 
-        self.num_reward_bins = 255
-        self.reward_bins = torch.linspace(-6.0, 6.0, self.num_reward_bins, device=self.device)
-
+        K = self.model.config["num_reward_bins"]
+        reward_low, reward_high = -6.0, 6.0
+        bins_linear = torch.linspace(reward_low, reward_high, K, device=self.device)
+        self.reward_bins = self.symlog(bins_linear)   
     
     def symlog(self, x: torch.Tensor) -> torch.Tensor:
         return torch.sign(x) * torch.log1p(torch.abs(x))

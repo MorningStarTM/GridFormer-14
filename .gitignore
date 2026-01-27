@@ -172,3 +172,4 @@ cython_debug/
 /notebook
 /data
 /new_data
+/checkpoints

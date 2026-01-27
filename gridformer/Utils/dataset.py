@@ -386,13 +386,6 @@ def load_from_multiple_pkl_as_numpy_with_steps(
 
 
 
-
-
-import numpy as np
-import torch
-from torch.utils.data import Dataset
-
-
 class RunningStandardScaler:
     """
     Streaming mean/std scaler (Welford-style merge) for feature-wise normalization.
@@ -477,6 +470,31 @@ class RunningStandardScaler:
         mean_t = torch.tensor(self.mean, dtype=dtype, device=t.device)
         std_t = torch.sqrt(torch.tensor(self.var, dtype=dtype, device=t.device)) + self.eps
         return (t - mean_t) / std_t
+    
+
+    def unnormalize(self, x_norm, device=None, dtype=torch.float32):
+        """
+        Inverse of normalize(): convert normalized values back to original scale.
+        x_norm can be numpy or torch. Returns torch.Tensor.
+        """
+        if self.mean is None or self.var is None or self.count == 0:
+            raise RuntimeError("Scaler has no stats. Call update() first or load_state_dict().")
+
+        if isinstance(x_norm, torch.Tensor):
+            t = x_norm
+            if dtype is not None and t.dtype != dtype:
+                t = t.to(dtype)
+        else:
+            t = torch.tensor(np.asarray(x_norm, np.float32), dtype=dtype)
+
+        if device is not None:
+            t = t.to(device)
+
+        mean_t = torch.tensor(self.mean, dtype=t.dtype, device=t.device)
+        std_t  = torch.sqrt(torch.tensor(self.var, dtype=t.dtype, device=t.device)) + self.eps
+
+        return t * std_t + mean_t
+
 
     def state_dict(self):
         return {

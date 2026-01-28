@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 import os
 import json
 import numpy as np
@@ -353,10 +355,53 @@ class WMTrainer:
         self.model.to(self.device)
         self.model.print_param_size()
 
+        self.optimizer = self.model.optimizer  # <--- ADD THIS LINE
+
         K = self.model.config["num_reward_bins"]
         reward_low, reward_high = -6.0, 6.0
         bins_linear = torch.linspace(reward_low, reward_high, K, device=self.device)
-        self.reward_bins = self.symlog(bins_linear)   
+        self.reward_bins = self.symlog(bins_linear)
+
+    def _is_ddp(self):
+        return isinstance(self.model, DDP)
+
+    def _rank(self):
+        return dist.get_rank() if dist.is_initialized() else 0
+
+    def _world_size(self):
+        return dist.get_world_size() if dist.is_initialized() else 1
+
+    def _is_main(self):
+        return self._rank() == 0   
+    
+    def wrap_ddp(self, local_rank: int):
+        """
+        Call this ONCE per process after dist.init_process_group().
+        """
+        self.device = torch.device(f"cuda:{local_rank}")
+        torch.cuda.set_device(local_rank)
+
+        # move model to this GPU
+        if isinstance(self.model, DDP):
+            return
+
+        self.model.to(self.device)
+
+        # reward_bins must live on the same device
+        K = self.model.config["num_reward_bins"]
+        reward_low, reward_high = -6.0, 6.0
+        bins_linear = torch.linspace(reward_low, reward_high, K, device=self.device)
+        self.reward_bins = self.symlog(bins_linear)
+
+        # wrap model
+        self.model = DDP(self.model, device_ids=[local_rank], output_device=local_rank)
+
+        # IMPORTANT: optimizer must exist on trainer (not on DDP wrapper)
+        # If you added self.optimizer = self.model.optimizer in __init__, keep it.
+        # If not, create optimizer here:
+        if not hasattr(self, "optimizer") or self.optimizer is None:
+            self.optimizer = torch.optim.AdamW(self.model.module.parameters(), lr=self.model.module.config["learning_rate"])
+
     
     def symlog(self, x: torch.Tensor) -> torch.Tensor:
         return torch.sign(x) * torch.log1p(torch.abs(x))
@@ -580,6 +625,218 @@ class WMTrainer:
 
                 else:
                     logger.info(
+                            f"Epoch {ep}/{epochs} | "
+                            f"train: total={train_loss:.6f} obs={train_loss_obs:.6f} rew={train_loss_reward:.6f} done={train_loss_done:.6f} | "
+                            f"val: total={val_loss:.6f} obs={val_loss_obs:.6f} rew={val_loss_reward:.6f} done={val_loss_done:.6f}"
+                        )
+
+        return history
+    
+
+
+    def train_ddp_amp(
+        self,
+        train_loader,
+        epochs=10,
+        val_loader=None,
+        log_every=1,
+        grad_clip_norm: float = 1.0,
+        amp_dtype=torch.float16,  # or torch.bfloat16 if your GPU supports it
+        best_path: str = "checkpoints/best_model",
+        patience: int = 10,
+    ):
+        """
+        DDP + Mixed Precision training.
+        Assumptions:
+          - dist.init_process_group(...) already called
+          - self.wrap_ddp(local_rank) already called
+          - train_loader uses DistributedSampler (so each rank gets different batches)
+        """
+
+        history = {"train_loss": []}
+        if val_loader is not None:
+            history["val_loss"] = []
+
+        history["train_loss_obs"] = []
+        history["train_loss_reward"] = []
+        history["train_loss_done"] = []
+        if val_loader is not None:
+            history["val_loss_obs"] = []
+            history["val_loss_reward"] = []
+            history["val_loss_done"] = []
+
+        # access config from underlying module when DDP
+        model_cfg = self.model.module.config if self._is_ddp() else self.model.config
+        max_t = model_cfg["max_timestep"]
+        act_n = model_cfg["action_size"]
+
+        scaler = torch.cuda.amp.GradScaler(enabled=True)
+
+        best_metric = math.inf
+        best_epoch = 0
+        bad_epochs = 0
+
+        for ep in range(1, epochs + 1):
+            # set epoch for distributed sampler (important!)
+            if hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_epoch"):
+                train_loader.sampler.set_epoch(ep)
+
+            # -------- TRAIN --------
+            self.model.train()
+            total_loss = torch.zeros(1, device=self.device)
+            total_obs = torch.zeros(1, device=self.device)
+            total_rew = torch.zeros(1, device=self.device)
+            total_done = torch.zeros(1, device=self.device)
+            n_batches = torch.zeros(1, device=self.device)
+
+            for batch in train_loader:
+                obs, action, reward, done, next_obs, step = batch
+
+                # checks (avoid CPU sync if possible; keep as-is for safety)
+                if step.max().item() >= max_t or step.min().item() < 0:
+                    raise ValueError(f"[epoch {ep}] step out of range: [{step.min().item()}, {step.max().item()}], max_timestep={max_t}")
+                if action.max().item() >= act_n or action.min().item() < 0:
+                    raise ValueError(f"[epoch {ep}] action out of range: [{action.min().item()}, {action.max().item()}], action_size={act_n}")
+
+                # move to this rank's GPU
+                obs      = obs.to(self.device, non_blocking=True)
+                action   = action.to(self.device, non_blocking=True)
+                reward   = reward.to(self.device, non_blocking=True)
+                done     = done.to(self.device, non_blocking=True)
+                next_obs = next_obs.to(self.device, non_blocking=True)
+                step     = step.to(self.device, non_blocking=True)
+
+                self.optimizer.zero_grad(set_to_none=True)
+
+                with torch.cuda.amp.autocast(dtype=amp_dtype):
+                    obs_pred, reward_pred, done_pred = self.model(obs, action, step)
+
+                    loss_obs = F.mse_loss(obs_pred, next_obs)
+
+                    reward_symlog = self.symlog(reward)  # (B,T,1)
+                    reward_target_dist = self.two_hot_targets(reward_symlog, self.reward_bins)  # (B,T,K)
+                    loss_reward = self.soft_ce_loss(reward_pred, reward_target_dist)
+
+                    loss_done = F.binary_cross_entropy_with_logits(done_pred, done)
+
+                    loss = loss_obs + loss_reward + loss_done
+
+                scaler.scale(loss).backward()
+
+                # clip grad (must unscale first)
+                scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip_norm)
+
+                scaler.step(self.optimizer)
+                scaler.update()
+
+                total_loss += loss.detach()
+                total_obs  += loss_obs.detach()
+                total_rew  += loss_reward.detach()
+                total_done += loss_done.detach()
+                n_batches  += 1
+
+            # reduce across ranks
+            if dist.is_initialized():
+                for t in (total_loss, total_obs, total_rew, total_done, n_batches):
+                    dist.all_reduce(t, op=dist.ReduceOp.SUM)
+
+            train_loss = (total_loss / torch.clamp(n_batches, min=1)).item()
+            train_loss_obs = (total_obs / torch.clamp(n_batches, min=1)).item()
+            train_loss_reward = (total_rew / torch.clamp(n_batches, min=1)).item()
+            train_loss_done = (total_done / torch.clamp(n_batches, min=1)).item()
+
+            if self._is_main():
+                history["train_loss"].append(train_loss)
+                history["train_loss_obs"].append(train_loss_obs)
+                history["train_loss_reward"].append(train_loss_reward)
+                history["train_loss_done"].append(train_loss_done)
+
+            # -------- VAL --------
+            val_loss = None
+            if val_loader is not None:
+                self.model.eval()
+                v_total = torch.zeros(1, device=self.device)
+                v_obs   = torch.zeros(1, device=self.device)
+                v_rew   = torch.zeros(1, device=self.device)
+                v_done  = torch.zeros(1, device=self.device)
+                v_batches = torch.zeros(1, device=self.device)
+
+                with torch.no_grad():
+                    for batch in val_loader:
+                        obs, action, reward, done, next_obs, step = batch
+
+                        if step.max().item() >= max_t or step.min().item() < 0:
+                            raise ValueError(f"[val epoch {ep}] step out of range: [{step.min().item()}, {step.max().item()}], max_timestep={max_t}")
+                        if action.max().item() >= act_n or action.min().item() < 0:
+                            raise ValueError(f"[val epoch {ep}] action out of range: [{action.min().item()}, {action.max().item()}], action_size={act_n}")
+
+                        obs      = obs.to(self.device, non_blocking=True)
+                        action   = action.to(self.device, non_blocking=True)
+                        reward   = reward.to(self.device, non_blocking=True)
+                        done     = done.to(self.device, non_blocking=True)
+                        next_obs = next_obs.to(self.device, non_blocking=True)
+                        step     = step.to(self.device, non_blocking=True)
+
+                        with torch.cuda.amp.autocast(dtype=amp_dtype):
+                            obs_pred, reward_pred, done_pred = self.model(obs, action, step)
+
+                            loss_obs = F.mse_loss(obs_pred, next_obs)
+                            reward_symlog = self.symlog(reward)
+                            reward_target_dist = self.two_hot_targets(reward_symlog, self.reward_bins)
+                            loss_reward = self.soft_ce_loss(reward_pred, reward_target_dist)
+                            loss_done = F.binary_cross_entropy_with_logits(done_pred, done)
+
+                            loss = loss_obs + loss_reward + loss_done
+
+                        v_total += loss.detach()
+                        v_obs   += loss_obs.detach()
+                        v_rew   += loss_reward.detach()
+                        v_done  += loss_done.detach()
+                        v_batches += 1
+
+                if dist.is_initialized():
+                    for t in (v_total, v_obs, v_rew, v_done, v_batches):
+                        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+
+                val_loss = (v_total / torch.clamp(v_batches, min=1)).item()
+                val_loss_obs = (v_obs / torch.clamp(v_batches, min=1)).item()
+                val_loss_reward = (v_rew / torch.clamp(v_batches, min=1)).item()
+                val_loss_done = (v_done / torch.clamp(v_batches, min=1)).item()
+
+                if self._is_main():
+                    history["val_loss"].append(val_loss)
+                    history["val_loss_obs"].append(val_loss_obs)
+                    history["val_loss_reward"].append(val_loss_reward)
+                    history["val_loss_done"].append(val_loss_done)
+
+            # early stop + checkpoint (rank 0 only)
+            current_metric = val_loss if (val_loader is not None) else train_loss
+            if self._is_main():
+                if current_metric < (best_metric - 1e-8):
+                    best_metric = current_metric
+                    best_epoch = ep
+                    bad_epochs = 0
+
+                    # must save underlying module when DDP
+                    save_model = self.model.module if self._is_ddp() else self.model
+                    save_model.save_safetensors(best_path)
+
+                    logger.info(f"[ckpt] saved best at epoch {ep}: metric={best_metric:.6f} -> {best_path}")
+                else:
+                    bad_epochs += 1
+                    if bad_epochs >= patience:
+                        logger.info(f"[early stop] no improvement for {patience} epochs. best_epoch={best_epoch}, best_metric={best_metric:.6f}")
+                        break
+
+                if (ep % log_every) == 0:
+                    if val_loader is None:
+                        logger.info(
+                            f"Epoch {ep}/{epochs} | "
+                            f"train: total={train_loss:.6f} obs={train_loss_obs:.6f} rew={train_loss_reward:.6f} done={train_loss_done:.6f}"
+                        )
+                    else:
+                        logger.info(
                             f"Epoch {ep}/{epochs} | "
                             f"train: total={train_loss:.6f} obs={train_loss_obs:.6f} rew={train_loss_reward:.6f} done={train_loss_done:.6f} | "
                             f"val: total={val_loss:.6f} obs={val_loss_obs:.6f} rew={val_loss_reward:.6f} done={val_loss_done:.6f}"

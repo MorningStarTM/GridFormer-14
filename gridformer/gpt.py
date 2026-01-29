@@ -426,7 +426,8 @@ class WMTrainer:
         hi_c = bin_centers[hi]  # (B,T)
 
         hi_w = (x - lo_c) / (hi_c - lo_c + 1e-8)
-        lo_w = 1.0 - hi_w
+        hi_w = hi_w.clamp(0.0, 1.0)
+        lo_w = (1.0 - hi_w).clamp(0.0, 1.0)
 
         target = torch.zeros(x.shape[0], x.shape[1], K, device=x.device, dtype=torch.float32)
         target.scatter_(2, lo.unsqueeze(-1), lo_w.unsqueeze(-1))
@@ -434,12 +435,26 @@ class WMTrainer:
         return target
 
     def soft_ce_loss(self, logits: torch.Tensor, target_dist: torch.Tensor) -> torch.Tensor:
-        """
-        logits: (B,T,K)
-        target_dist: (B,T,K), sums to 1
-        """
-        logp = F.log_softmax(logits, dim=-1)
-        return -(target_dist * logp).sum(dim=-1).mean()
+        # compute CE in float32 (AMP-safe)
+        logits = logits.float()
+        target = target_dist.float()
+
+        # ensure valid distribution (tiny drift guard)
+        target = torch.clamp(target, min=0.0)
+        target = target / (target.sum(dim=-1, keepdim=True) + 1e-8)
+
+        logp = F.log_softmax(logits, dim=-1)      # <= 0
+        ce = -(target * logp).sum(dim=-1)        # >= 0
+        loss = ce.mean()
+
+        # hard guard: if this triggers, your code path still wrong somewhere
+        if not torch.isfinite(loss):
+            raise ValueError(f"Non-finite reward loss: {loss.item()}")
+        if loss.item() < -1e-6:
+            raise ValueError(f"Reward loss went negative: {loss.item()}")
+
+        return loss
+
     
 
 
